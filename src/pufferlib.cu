@@ -310,7 +310,21 @@ typedef struct {
     // Threading
     int num_threads;
     int seed;
+    int network_type;
+    int encoder_type;
+    int expansion_factor;
+    float c_shift;
 } HypersT;
+
+enum NetworkType {
+    NETWORK_MINGRU = 0,
+    NETWORK_SIMBAV2 = 1,
+};
+
+enum EncoderType {
+    ENCODER_DEFAULT = 0,
+    ENCODER_SV2 = 1,
+};
 
 // A frozen weight bank: same shape as the primary, but its own params buffer
 // (and per-buffer rollout states/activations). Used for match (eval) and league
@@ -1617,6 +1631,10 @@ void train_impl(PuffeRL& pufferl) {
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
             muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            if (pufferl.policy.post_step) {
+                pufferl.policy.post_step(pufferl.weights.encoder, pufferl.weights.network,
+                    pufferl.param_puf.data, pufferl.master_weights.data, stream);
+            }
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
                 cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
@@ -1678,21 +1696,89 @@ void train_impl(PuffeRL& pufferl) {
 // has no heap state so this returns by value; callers store it wherever.
 static Policy build_policy(const char* env_name, int input_size, int hidden_size,
                            int num_layers, int decoder_output_size, int act_n,
-                           bool is_continuous, int horizon) {
-    Encoder encoder = {
-        .forward = encoder_forward,
-        .backward = encoder_backward,
-        .init_weights = encoder_init_weights,
-        .reg_params = encoder_reg_params,
-        .reg_train = encoder_reg_train,
-        .reg_rollout = encoder_reg_rollout,
-        .create_weights = encoder_create_weights,
-        .free_weights = encoder_free_weights,
-        .free_activations = encoder_free_activations,
-        .in_dim = input_size, .out_dim = hidden_size,
-        .activation_size = sizeof(EncoderActivations),
-    };
-    create_custom_encoder(env_name, &encoder);
+                           bool is_continuous, int horizon, int network_type,
+                           int encoder_type, int expansion_factor, float c_shift) {
+    Encoder encoder;
+    Network network;
+    policy_post_step_fn post_step = nullptr;
+
+    switch ((EncoderType)encoder_type) {
+    case ENCODER_SV2:
+        encoder = {
+            .forward = sv2_encoder_forward,
+            .backward = sv2_encoder_backward,
+            .init_weights = sv2_encoder_init_weights,
+            .reg_params = sv2_encoder_reg_params,
+            .reg_train = sv2_encoder_reg_train,
+            .reg_rollout = sv2_encoder_reg_rollout,
+            .create_weights = sv2_encoder_create_weights,
+            .free_weights = sv2_encoder_free_weights,
+            .free_activations = sv2_encoder_free_activations,
+            .in_dim = input_size, .out_dim = hidden_size,
+            .c_shift = c_shift,
+            .activation_size = sizeof(SV2EncoderActivations),
+        };
+        break;
+    case ENCODER_DEFAULT:
+    default:
+        encoder = {
+            .forward = encoder_forward,
+            .backward = encoder_backward,
+            .init_weights = encoder_init_weights,
+            .reg_params = encoder_reg_params,
+            .reg_train = encoder_reg_train,
+            .reg_rollout = encoder_reg_rollout,
+            .create_weights = encoder_create_weights,
+            .free_weights = encoder_free_weights,
+            .free_activations = encoder_free_activations,
+            .in_dim = input_size, .out_dim = hidden_size,
+            .activation_size = sizeof(EncoderActivations),
+        };
+        create_custom_encoder(env_name, &encoder);
+        break;
+    }
+
+    switch ((NetworkType)network_type) {
+    case NETWORK_SIMBAV2:
+        network = {
+            .forward = sv2_network_forward,
+            .forward_train = sv2_network_forward_train,
+            .backward = sv2_network_backward,
+            .init_weights = sv2_network_init_weights,
+            .reg_params = sv2_network_reg_params,
+            .reg_train = sv2_network_reg_train,
+            .reg_rollout = sv2_network_reg_rollout,
+            .create_weights = sv2_network_create_weights,
+            .free_weights = sv2_network_free_weights,
+            .free_activations = sv2_network_free_activations,
+            .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+            .expansion = expansion_factor,
+            .activation_size = sizeof(SV2NetworkActivations),
+        };
+        post_step = (encoder_type == ENCODER_SV2) ? sv2_post_step : sv2_network_only_post_step;
+        break;
+    case NETWORK_MINGRU:
+    default:
+        network = {
+            .forward = mingru_forward,
+            .forward_train = mingru_forward_train,
+            .backward = mingru_backward,
+            .init_weights = mingru_init_weights,
+            .reg_params = mingru_reg_params,
+            .reg_train = mingru_reg_train,
+            .reg_rollout = mingru_reg_rollout,
+            .create_weights = mingru_create_weights,
+            .free_weights = mingru_free_weights,
+            .free_activations = mingru_free_activations,
+            .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+            .l2norm_layers = (encoder_type == ENCODER_SV2),
+            .activation_size = sizeof(MinGRUActivations),
+        };
+        if (encoder_type == ENCODER_SV2)
+            post_step = hyper_mingru_post_step;
+        break;
+    }
+
     Decoder decoder = {
         .forward = decoder_forward,
         .backward = decoder_backward,
@@ -1704,24 +1790,14 @@ static Policy build_policy(const char* env_name, int input_size, int hidden_size
         .free_weights = decoder_free_weights,
         .free_activations = decoder_free_activations,
         .hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous,
+        .activation_size = sizeof(DecoderActivations),
     };
-    Network network = {
-        .forward = mingru_forward,
-        .forward_train = mingru_forward_train,
-        .backward = mingru_backward,
-        .init_weights = mingru_init_weights,
-        .reg_params = mingru_reg_params,
-        .reg_train = mingru_reg_train,
-        .reg_rollout = mingru_reg_rollout,
-        .create_weights = mingru_create_weights,
-        .free_weights = mingru_free_weights,
-        .free_activations = mingru_free_activations,
-        .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
-    };
+
     return Policy{
         .encoder = encoder, .decoder = decoder, .network = network,
         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
         .num_atns = act_n,
+        .post_step = post_step,
     };
 }
 
@@ -1740,7 +1816,9 @@ static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl,
     for (int i = 0; i < num_action_heads; i++) act_n += raw_act_sizes[i];
     int decoder_output_size = pufferl->is_continuous ? num_action_heads : act_n;
     bank->policy = build_policy(pufferl->env_name.c_str(), input_size, hidden_size,
-        num_layers, decoder_output_size, act_n, pufferl->is_continuous, pufferl->hypers.horizon);
+        num_layers, decoder_output_size, act_n, pufferl->is_continuous, pufferl->hypers.horizon,
+        pufferl->hypers.network_type, pufferl->hypers.encoder_type,
+        pufferl->hypers.expansion_factor, pufferl->hypers.c_shift);
     bank->hidden_size = hidden_size;
     bank->num_layers = num_layers;
 
@@ -1979,7 +2057,9 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int num_buffers = hypers.num_buffers;
 
     pufferl->policy = build_policy(env_name.c_str(), input_size, hidden_size,
-        num_layers, decoder_output_size, act_n, is_continuous, hypers.horizon);
+        num_layers, decoder_output_size, act_n, is_continuous, hypers.horizon,
+        hypers.network_type, hypers.encoder_type,
+        hypers.expansion_factor, hypers.c_shift);
 
     // Create and allocate params
     Allocator* params = &pufferl->params_alloc;
@@ -2052,6 +2132,16 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         int n = numel(pufferl->param_puf.shape);
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
             pufferl->master_weights.data, pufferl->param_puf.data, n);
+    }
+
+    if (pufferl->policy.post_step) {
+        pufferl->policy.post_step(pufferl->weights.encoder, pufferl->weights.network,
+            pufferl->param_puf.data, pufferl->master_weights.data, pufferl->default_stream);
+        if (USE_BF16) {
+            int n = numel(pufferl->param_puf.shape);
+            cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+                pufferl->param_puf.data, pufferl->master_weights.data, n);
+        }
     }
 
     // Per-buffer persistent RNG states

@@ -401,6 +401,10 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     // Model architecture (num_atns computed from env in C++)
     hypers.hidden_size = get_config(policy_kwargs, "hidden_size");
     hypers.num_layers = get_config(policy_kwargs, "num_layers");
+    hypers.network_type = get_config(policy_kwargs, "network_type");
+    hypers.encoder_type = get_config(policy_kwargs, "encoder_type");
+    hypers.expansion_factor = get_config(policy_kwargs, "expansion_factor");
+    hypers.c_shift = get_config(policy_kwargs, "c_shift");
     // Learning rate
     hypers.lr = get_config(train_kwargs, "learning_rate");
     hypers.min_lr_ratio = get_config(train_kwargs, "min_lr_ratio");
@@ -566,7 +570,11 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("rank", &HypersT::rank)
         .def_readwrite("world_size", &HypersT::world_size)
         .def_readwrite("gpu_id", &HypersT::gpu_id)
-        .def_readwrite("nccl_id", &HypersT::nccl_id);
+        .def_readwrite("nccl_id", &HypersT::nccl_id)
+        .def_readwrite("network_type", &HypersT::network_type)
+        .def_readwrite("encoder_type", &HypersT::encoder_type)
+        .def_readwrite("expansion_factor", &HypersT::expansion_factor)
+        .def_readwrite("c_shift", &HypersT::c_shift);
 
     py::class_<PrecisionTensor>(m, "PrecisionTensor")
         .def("__repr__", [](const PrecisionTensor& t) { return std::string(puf_repr(&t)); })

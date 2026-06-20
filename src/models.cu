@@ -43,6 +43,7 @@ struct Encoder {
     free_weights_fn free_weights;
     free_activations_fn free_activations;
     int in_dim, out_dim;
+    float c_shift;
     size_t activation_size;  // sizeof(EncoderActivations) or custom override
 };
 
@@ -58,6 +59,7 @@ struct Decoder {
     free_activations_fn free_activations;
     int hidden_dim, output_dim;
     bool continuous;
+    size_t activation_size;
 };
 
 struct Network {
@@ -72,6 +74,9 @@ struct Network {
     free_weights_fn free_weights;
     free_activations_fn free_activations;
     int hidden, num_layers, horizon;
+    int expansion;
+    bool l2norm_layers;
+    size_t activation_size;
 };
 
 struct EncoderWeights {
@@ -570,6 +575,58 @@ static PrecisionTensor decoder_backward(void* w, void* activations,
     return a->grad_input;
 }
 
+#define SV2_EPS 1e-8f
+
+__global__ void sv2_l2norm_fwd(precision_t* out, float* norms_out,
+        const precision_t* input, int num_rows, int row_len) {
+    int row = blockIdx.x;
+    if (row >= num_rows) return;
+    __shared__ float sdata[BLOCK_SIZE];
+    float sum = 0;
+    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
+        float v = to_float(input[row * row_len + j]);
+        sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float norm = sqrtf(sdata[0]);
+    if (threadIdx.x == 0 && norms_out) norms_out[row] = norm;
+    float inv = 1.0f / fmaxf(norm, SV2_EPS);
+    for (int j = threadIdx.x; j < row_len; j += blockDim.x)
+        out[row * row_len + j] = from_float(to_float(input[row * row_len + j]) * inv);
+}
+
+__global__ void sv2_l2norm_dots(float* dots, const precision_t* grad_y,
+        const precision_t* y, int num_rows, int row_len) {
+    int row = blockIdx.x;
+    if (row >= num_rows) return;
+    __shared__ float sdata[BLOCK_SIZE];
+    float sum = 0;
+    for (int j = threadIdx.x; j < row_len; j += blockDim.x)
+        sum += to_float(grad_y[row * row_len + j]) * to_float(y[row * row_len + j]);
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) dots[row] = sdata[0];
+}
+
+__global__ void sv2_l2norm_bwd(precision_t* grad_x, const precision_t* grad_y,
+        const precision_t* y, const float* dots, const float* norms,
+        int N, int row_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    int row = idx / row_len;
+    float inv = 1.0f / fmaxf(norms[row], SV2_EPS);
+    grad_x[idx] = from_float((to_float(grad_y[idx]) - to_float(y[idx]) * dots[row]) * inv);
+}
+
 struct MinGRUActivations {
     int num_layers;
     // Rollout
@@ -583,6 +640,9 @@ struct MinGRUActivations {
     PrecisionTensor* wgrad_scratch;  // (3*T, T)[num_layers]
     PrecisionTensor grad_input_buf;  // (B*TT, T)
     PrecisionTensor grad_next_state; // (B, 1, T)
+    FloatTensor* layer_norms;        // [num_layers] (B_TT,)
+    FloatTensor l2_dots;             // (B_TT,)
+    PrecisionTensor l2_grad_buf;     // (B_TT, H)
 };
 
 void mingru_activations_free(MinGRUActivations* a) {
@@ -591,10 +651,12 @@ void mingru_activations_free(MinGRUActivations* a) {
     free(a->scan_bufs);
     free(a->combined_bufs);
     free(a->wgrad_scratch);
+    free(a->layer_norms);
 }
 
 struct MinGRUWeights {
     int hidden, num_layers, horizon;
+    bool l2norm_layers;
     PrecisionTensor* weights;  // [num_layers]
 };
 
@@ -662,6 +724,17 @@ static void mingru_reg_train(void* w, void* activations, Allocator* acts, Alloca
         alloc_register(acts,&a->scan_bufs[i].grad_input);
         alloc_register(grads,&a->wgrad_scratch[i]);
     }
+    if (m->l2norm_layers) {
+        a->layer_norms = (FloatTensor*)calloc(m->num_layers, sizeof(FloatTensor));
+        a->l2_dots = {.shape = {B_TT}};
+        a->l2_grad_buf = {.shape = {B_TT, H}};
+        alloc_register(acts, &a->l2_dots);
+        alloc_register(acts, &a->l2_grad_buf);
+        for (int i = 0; i < m->num_layers; i++) {
+            a->layer_norms[i] = {.shape = {B_TT}};
+            alloc_register(acts, &a->layer_norms[i]);
+        }
+    }
 }
 
 static void mingru_reg_rollout(void* weights, void* activations, Allocator* alloc, int B_inf) {
@@ -684,6 +757,7 @@ static void* mingru_create_weights(void* self) {
     Network* n = (Network*)self;
     MinGRUWeights* mw = (MinGRUWeights*)calloc(1, sizeof(MinGRUWeights));
     mw->hidden = n->hidden; mw->num_layers = n->num_layers; mw->horizon = n->horizon;
+    mw->l2norm_layers = n->l2norm_layers;
     mw->weights = (PrecisionTensor*)calloc(n->num_layers, sizeof(PrecisionTensor));
     return mw;
 }
@@ -713,6 +787,9 @@ static PrecisionTensor mingru_forward(void* w, PrecisionTensor x, PrecisionTenso
             a->out.data, a->next_state.data,
             a->combined[i].data, state_i.data, x.data, H, B);
         puf_copy(&state_i, &a->next_state, stream);
+        if (m->l2norm_layers)
+            sv2_l2norm_fwd<<<B, BLOCK_SIZE, 0, stream>>>(
+                a->out.data, nullptr, a->out.data, B, H);
         x = a->out;
     }
     return x;
@@ -731,6 +808,12 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
         a->scan_bufs[i].state_ptr = state_i.data;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].data;
         mingru_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
+        if (m->l2norm_layers) {
+            int B_TT = a->scan_bufs[i].B * a->scan_bufs[i].T;
+            sv2_l2norm_fwd<<<B_TT, BLOCK_SIZE, 0, stream>>>(
+                a->scan_bufs[i].out.data, a->layer_norms[i].data,
+                a->scan_bufs[i].out.data, B_TT, m->hidden);
+        }
         x = a->scan_bufs[i].out;
     }
     return x;
@@ -741,8 +824,19 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
     MinGRUActivations* a = (MinGRUActivations*)activations;
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
+        precision_t* grad_ptr = grad.data;
+        if (m->l2norm_layers) {
+            int B_TT = scan.B * scan.T;
+            int N = B_TT * scan.H;
+            sv2_l2norm_dots<<<B_TT, BLOCK_SIZE, 0, stream>>>(
+                a->l2_dots.data, grad.data, scan.out.data, B_TT, scan.H);
+            sv2_l2norm_bwd<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+                a->l2_grad_buf.data, grad.data, scan.out.data,
+                a->l2_dots.data, a->layer_norms[i].data, N, scan.H);
+            grad_ptr = a->l2_grad_buf.data;
+        }
         mingru_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
-            scan, grad.data, a->grad_next_state.data);
+            scan, grad_ptr, a->grad_next_state.data);
         puf_mm_tn(&scan.grad_combined, &a->saved_inputs[i], &a->wgrad_scratch[i], stream);
         puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);
         int n = numel(scan.grad_input.shape);
@@ -753,12 +847,609 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
     return grad;
 }
 
+typedef void (*policy_post_step_fn)(void* encoder_w, void* network_w,
+    precision_t* param_base, float* master_weights, cudaStream_t stream);
+
+// SimbaV2: Hyperspherical RL Architecture
+
+__global__ void sv2_augment_const(precision_t* dst, const precision_t* src,
+        float c_shift, int num_rows, int in_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_dim = in_dim + 1;
+    int total = num_rows * out_dim;
+    if (idx >= total) return;
+    int b = idx / out_dim, j = idx % out_dim;
+    dst[idx] = (j < in_dim) ? src[b * in_dim + j] : from_float(c_shift);
+}
+
+__global__ void sv2_scale(precision_t* out, const precision_t* input,
+        const precision_t* scaler, float fwd_scaler, int N, int H) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    out[idx] = from_float(to_float(scaler[idx % H]) * fwd_scaler * to_float(input[idx]));
+}
+
+__global__ void sv2_scale_relu_eps(precision_t* out, const precision_t* input,
+        const precision_t* scaler, float fwd_scaler, int N, int H) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    float v = to_float(scaler[idx % H]) * fwd_scaler * to_float(input[idx]);
+    out[idx] = from_float(fmaxf(0.0f, v) + SV2_EPS);
+}
+
+__global__ void sv2_lerp(precision_t* dst, const precision_t* residual,
+        const precision_t* mlp, const precision_t* alpha, float alpha_fwd,
+        int N, int H) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    float r = to_float(residual[idx]);
+    float m = to_float(mlp[idx]);
+    float a = to_float(alpha[idx % H]) * alpha_fwd;
+    dst[idx] = from_float(r + a * (m - r));
+}
+
+__global__ void sv2_scale_grad(precision_t* grad_scaler,
+        const precision_t* grad_y, const precision_t* x,
+        float fwd_scaler, int num_rows, int H) {
+    int h = blockIdx.x;
+    if (h >= H) return;
+    __shared__ float sdata[BLOCK_SIZE];
+    float sum = 0;
+    for (int b = threadIdx.x; b < num_rows; b += blockDim.x)
+        sum += to_float(grad_y[b * H + h]) * to_float(x[b * H + h]);
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_scaler[h] = from_float(fwd_scaler * sdata[0]);
+}
+
+__global__ void sv2_scale_relu_bwd(precision_t* grad_input,
+        const precision_t* grad_out, const precision_t* after_w1,
+        const precision_t* scaler, float fwd_scaler, int N, int H) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    float s = to_float(scaler[idx % H]) * fwd_scaler;
+    float pre_relu = s * to_float(after_w1[idx]);
+    float g = (pre_relu > 0.0f) ? to_float(grad_out[idx]) : 0.0f;
+    grad_input[idx] = from_float(s * g);
+}
+
+__global__ void sv2_scale_relu_grad(precision_t* grad_scaler,
+        const precision_t* grad_out, const precision_t* after_w1,
+        const precision_t* scaler, float fwd_scaler, int num_rows, int H) {
+    int h = blockIdx.x;
+    if (h >= H) return;
+    float s = to_float(scaler[h]) * fwd_scaler;
+    __shared__ float sdata[BLOCK_SIZE];
+    float sum = 0;
+    for (int b = threadIdx.x; b < num_rows; b += blockDim.x) {
+        float pre_relu = s * to_float(after_w1[b * H + h]);
+        float g = (pre_relu > 0.0f) ? to_float(grad_out[b * H + h]) : 0.0f;
+        sum += g * to_float(after_w1[b * H + h]);
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sdata[threadIdx.x] += sdata[threadIdx.x + s2];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_scaler[h] = from_float(fwd_scaler * sdata[0]);
+}
+
+__global__ void sv2_lerp_bwd(precision_t* grad_mlp, precision_t* grad_res,
+        const precision_t* grad_lerp, const precision_t* alpha,
+        float alpha_fwd, int N, int H) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    float gl = to_float(grad_lerp[idx]);
+    float a = to_float(alpha[idx % H]) * alpha_fwd;
+    grad_res[idx] = from_float((1.0f - a) * gl);
+    grad_mlp[idx] = from_float(a * gl);
+}
+
+__global__ void sv2_alpha_grad(precision_t* grad_alpha,
+        const precision_t* grad_lerp, const precision_t* mlp_out,
+        const precision_t* input, float alpha_fwd, int num_rows, int H) {
+    int h = blockIdx.x;
+    if (h >= H) return;
+    __shared__ float sdata[BLOCK_SIZE];
+    float sum = 0;
+    for (int b = threadIdx.x; b < num_rows; b += blockDim.x) {
+        float gl = to_float(grad_lerp[b * H + h]);
+        float diff = to_float(mlp_out[b * H + h]) - to_float(input[b * H + h]);
+        sum += gl * diff;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_alpha[h] = from_float(alpha_fwd * sdata[0]);
+}
+
+__global__ void sv2_l2norm_weight_rows(float* W, int M, int N) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+    float* r = W + row * N;
+    __shared__ float sdata[BLOCK_SIZE];
+    float sum = 0;
+    for (int j = threadIdx.x; j < N; j += blockDim.x) {
+        float v = r[j]; sum += v * v;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(fmaxf(sdata[0], SV2_EPS));
+    for (int j = threadIdx.x; j < N; j += blockDim.x) r[j] *= inv;
+}
+
+struct SV2EncoderWeights {
+    PrecisionTensor w;          // (H, obs+1)
+    PrecisionTensor scaler;     // (H,)
+    int in_dim, out_dim;
+    float scaler_fwd;
+    float c_shift;
+};
+
+struct SV2EncoderActivations {
+    PrecisionTensor augmented;  // (B, obs+1)
+    PrecisionTensor proj;       // (B, H)
+    PrecisionTensor out;        // (B, H)
+    FloatTensor scaled_norms;   // (B,)
+    PrecisionTensor wgrad;      // (H, obs+1)
+    PrecisionTensor scaler_grad;// (H,)
+    PrecisionTensor grad_buf;   // (B, H)
+    FloatTensor dots;           // (B,)
+};
+
+static PrecisionTensor sv2_encoder_forward(void* w, void* activations,
+        PrecisionTensor input, cudaStream_t stream) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)w;
+    SV2EncoderActivations* a = (SV2EncoderActivations*)activations;
+    int B = input.shape[0];
+    int aug_dim = ew->in_dim + 1;
+    int H = ew->out_dim;
+    int N_aug = B * aug_dim;
+    int N_h = B * H;
+
+    sv2_augment_const<<<grid_size(N_aug), BLOCK_SIZE, 0, stream>>>(
+        a->augmented.data, input.data, ew->c_shift, B, ew->in_dim);
+    sv2_l2norm_fwd<<<B, BLOCK_SIZE, 0, stream>>>(
+        a->augmented.data, nullptr, a->augmented.data, B, aug_dim);
+
+    if (a->proj.data) {
+        puf_mm(&a->augmented, &ew->w, &a->proj, stream);
+        sv2_scale<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->out.data, a->proj.data, ew->scaler.data, ew->scaler_fwd, N_h, H);
+    } else {
+        puf_mm(&a->augmented, &ew->w, &a->out, stream);
+        sv2_scale<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->out.data, a->out.data, ew->scaler.data, ew->scaler_fwd, N_h, H);
+    }
+    sv2_l2norm_fwd<<<B, BLOCK_SIZE, 0, stream>>>(
+        a->out.data, a->scaled_norms.data, a->out.data, B, H);
+    return a->out;
+}
+
+static void sv2_encoder_backward(void* w, void* activations,
+        PrecisionTensor grad, cudaStream_t stream) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)w;
+    SV2EncoderActivations* a = (SV2EncoderActivations*)activations;
+    int B_TT = a->proj.shape[0];
+    int H = ew->out_dim;
+    int N = B_TT * H;
+
+    sv2_l2norm_dots<<<B_TT, BLOCK_SIZE, 0, stream>>>(
+        a->dots.data, grad.data, a->out.data, B_TT, H);
+    sv2_l2norm_bwd<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+        a->grad_buf.data, grad.data, a->out.data, a->dots.data,
+        a->scaled_norms.data, N, H);
+
+    sv2_scale_grad<<<H, BLOCK_SIZE, 0, stream>>>(
+        a->scaler_grad.data, a->grad_buf.data, a->proj.data,
+        ew->scaler_fwd, B_TT, H);
+    sv2_scale<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+        a->grad_buf.data, a->grad_buf.data, ew->scaler.data, ew->scaler_fwd, N, H);
+
+    puf_mm_tn(&a->grad_buf, &a->augmented, &a->wgrad, stream);
+}
+
+static void sv2_encoder_init_weights(void* w, ulong* seed, cudaStream_t stream) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)w;
+    puf_normal_init(&ew->w, 1.0f, (*seed)++, stream);
+    float scaler_init_val = sqrtf(2.0f / ew->out_dim);
+    fill_precision_kernel<<<grid_size(ew->out_dim), BLOCK_SIZE, 0, stream>>>(
+        ew->scaler.data, from_float(scaler_init_val), ew->out_dim);
+}
+
+static void sv2_encoder_reg_params(void* w, Allocator* alloc) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)w;
+    int aug_dim = ew->in_dim + 1;
+    ew->w = {.shape = {ew->out_dim, aug_dim}};
+    ew->scaler = {.shape = {ew->out_dim}};
+    alloc_register(alloc, &ew->w);
+    alloc_register(alloc, &ew->scaler);
+}
+
+static void sv2_encoder_reg_train(void* w, void* activations,
+        Allocator* acts, Allocator* grads, int B_TT) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)w;
+    SV2EncoderActivations* a = (SV2EncoderActivations*)activations;
+    int aug_dim = ew->in_dim + 1;
+    int H = ew->out_dim;
+    *a = {};
+    a->augmented =    {.shape = {B_TT, aug_dim}};
+    a->proj =         {.shape = {B_TT, H}};
+    a->out =          {.shape = {B_TT, H}};
+    a->scaled_norms = {.shape = {B_TT}};
+    a->wgrad =        {.shape = {H, aug_dim}};
+    a->scaler_grad =  {.shape = {H}};
+    a->grad_buf =     {.shape = {B_TT, H}};
+    a->dots =         {.shape = {B_TT}};
+    alloc_register(acts, &a->augmented);
+    alloc_register(acts, &a->proj);
+    alloc_register(acts, &a->out);
+    alloc_register(acts, &a->scaled_norms);
+    alloc_register(acts, &a->grad_buf);
+    alloc_register(acts, &a->dots);
+    alloc_register(grads, &a->wgrad);
+    alloc_register(grads, &a->scaler_grad);
+}
+
+static void sv2_encoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)w;
+    SV2EncoderActivations* a = (SV2EncoderActivations*)activations;
+    int aug_dim = ew->in_dim + 1;
+    int H = ew->out_dim;
+    *a = {};
+    a->augmented = {.shape = {B, aug_dim}};
+    a->out =       {.shape = {B, H}};
+    a->scaled_norms = {};
+    alloc_register(alloc, &a->augmented);
+    alloc_register(alloc, &a->out);
+}
+
+static void* sv2_encoder_create_weights(void* self) {
+    Encoder* e = (Encoder*)self;
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)calloc(1, sizeof(SV2EncoderWeights));
+    ew->in_dim = e->in_dim;
+    ew->out_dim = e->out_dim;
+    ew->scaler_fwd = 1.0f;
+    ew->c_shift = e->c_shift;
+    return ew;
+}
+
+static void sv2_encoder_free_weights(void* w) { free(w); }
+static void sv2_encoder_free_activations(void* a) { free(a); }
+
+struct SV2NetworkWeights {
+    int hidden, num_blocks, horizon, expansion;
+    float mlp_scaler_fwd;
+    float alpha_fwd;
+    PrecisionTensor* w1;         // [num_blocks] (H*4, H)
+    PrecisionTensor* mlp_scaler; // [num_blocks] (H*4,)
+    PrecisionTensor* w2;         // [num_blocks] (H, H*4)
+    PrecisionTensor* alpha;      // [num_blocks] (H,)
+};
+
+struct SV2NetworkActivations {
+    int num_blocks;
+    PrecisionTensor saved_input0; // (B_TT, H)
+    PrecisionTensor* after_w1;    // [num_blocks] (B_TT, H*4)
+    PrecisionTensor* after_relu;  // [num_blocks] (B_TT, H*4)
+    PrecisionTensor* mlp_out;     // [num_blocks] (B_TT, H)
+    FloatTensor* mlp_norms;       // [num_blocks] (B_TT,)
+    PrecisionTensor* block_out;   // [num_blocks] (B_TT, H)
+    FloatTensor* block_norms;     // [num_blocks] (B_TT,)
+    PrecisionTensor* wgrad_w1;    // [num_blocks] (H*4, H)
+    PrecisionTensor* sgrad;       // [num_blocks] (H*4,)
+    PrecisionTensor* wgrad_w2;    // [num_blocks] (H, H*4)
+    PrecisionTensor* agrad;       // [num_blocks] (H,)
+    PrecisionTensor grad_a, grad_b; // (B_TT, H)
+    PrecisionTensor grad_h4;        // (B_TT, H*4)
+    FloatTensor dots;               // (B_TT,)
+    PrecisionTensor temp_h4;     // (B, H*4) rollout
+    PrecisionTensor temp_h;      // (B, H) rollout
+    PrecisionTensor out;         // (B, H) rollout
+};
+
+static PrecisionTensor sv2_network_forward(void* w, PrecisionTensor x,
+        PrecisionTensor state, void* activations, cudaStream_t stream) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    SV2NetworkActivations* a = (SV2NetworkActivations*)activations;
+    int B = x.shape[0], H = nw->hidden, H4 = H * nw->expansion;
+    int N_h4 = B * H4, N_h = B * H;
+
+    PrecisionTensor cur = x; // (B, H) — encoder output
+    for (int i = 0; i < nw->num_blocks; i++) {
+        puf_mm(&cur, &nw->w1[i], &a->temp_h4, stream);
+        sv2_scale_relu_eps<<<grid_size(N_h4), BLOCK_SIZE, 0, stream>>>(
+            a->temp_h4.data, a->temp_h4.data, nw->mlp_scaler[i].data,
+            nw->mlp_scaler_fwd, N_h4, H4);
+        puf_mm(&a->temp_h4, &nw->w2[i], &a->temp_h, stream);
+        sv2_l2norm_fwd<<<B, BLOCK_SIZE, 0, stream>>>(
+            a->temp_h.data, nullptr, a->temp_h.data, B, H);
+        sv2_lerp<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->out.data, cur.data, a->temp_h.data, nw->alpha[i].data,
+            nw->alpha_fwd, N_h, H);
+        sv2_l2norm_fwd<<<B, BLOCK_SIZE, 0, stream>>>(
+            a->out.data, nullptr, a->out.data, B, H);
+        cur = a->out;
+    }
+    return a->out;
+}
+
+static PrecisionTensor sv2_network_forward_train(void* w, PrecisionTensor x,
+        PrecisionTensor state, void* activations, cudaStream_t stream) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    SV2NetworkActivations* a = (SV2NetworkActivations*)activations;
+    int B = x.shape[0], TT = x.shape[1], H = nw->hidden;
+    int H4 = H * nw->expansion;
+    int B_TT = B * TT;
+    int N_h4 = B_TT * H4, N_h = B_TT * H;
+
+    PrecisionTensor x_flat = {.data = x.data, .shape = {B_TT, H}};
+    puf_copy(&a->saved_input0, &x_flat, stream);
+
+    PrecisionTensor cur = x_flat;
+    for (int i = 0; i < nw->num_blocks; i++) {
+        puf_mm(&cur, &nw->w1[i], &a->after_w1[i], stream);
+        sv2_scale_relu_eps<<<grid_size(N_h4), BLOCK_SIZE, 0, stream>>>(
+            a->after_relu[i].data, a->after_w1[i].data, nw->mlp_scaler[i].data,
+            nw->mlp_scaler_fwd, N_h4, H4);
+        puf_mm(&a->after_relu[i], &nw->w2[i], &a->mlp_out[i], stream);
+        sv2_l2norm_fwd<<<B_TT, BLOCK_SIZE, 0, stream>>>(
+            a->mlp_out[i].data, a->mlp_norms[i].data, a->mlp_out[i].data, B_TT, H);
+        sv2_lerp<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->block_out[i].data, cur.data, a->mlp_out[i].data, nw->alpha[i].data,
+            nw->alpha_fwd, N_h, H);
+        sv2_l2norm_fwd<<<B_TT, BLOCK_SIZE, 0, stream>>>(
+            a->block_out[i].data, a->block_norms[i].data, a->block_out[i].data, B_TT, H);
+        cur = a->block_out[i];
+    }
+    PrecisionTensor result = {.data = a->block_out[nw->num_blocks - 1].data, .shape = {B, TT, H}};
+    return result;
+}
+
+static PrecisionTensor sv2_network_backward(void* w, PrecisionTensor grad,
+        void* activations, cudaStream_t stream) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    SV2NetworkActivations* a = (SV2NetworkActivations*)activations;
+    int H = nw->hidden, H4 = H * nw->expansion;
+    int B_TT = numel(grad.shape) / H;
+    int N_h = B_TT * H, N_h4 = B_TT * H4;
+
+    PrecisionTensor grad_in = grad;
+
+    for (int i = nw->num_blocks - 1; i >= 0; i--) {
+        PrecisionTensor* input_i = (i == 0) ? &a->saved_input0 : &a->block_out[i - 1];
+
+        sv2_l2norm_dots<<<B_TT, BLOCK_SIZE, 0, stream>>>(
+            a->dots.data, grad_in.data, a->block_out[i].data, B_TT, H);
+        sv2_l2norm_bwd<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->grad_a.data, grad_in.data, a->block_out[i].data,
+            a->dots.data, a->block_norms[i].data, N_h, H);
+
+        sv2_alpha_grad<<<H, BLOCK_SIZE, 0, stream>>>(
+            a->agrad[i].data, a->grad_a.data, a->mlp_out[i].data,
+            input_i->data, nw->alpha_fwd, B_TT, H);
+
+        sv2_lerp_bwd<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->grad_a.data, a->grad_b.data, a->grad_a.data,
+            nw->alpha[i].data, nw->alpha_fwd, N_h, H);
+
+        sv2_l2norm_dots<<<B_TT, BLOCK_SIZE, 0, stream>>>(
+            a->dots.data, a->grad_a.data, a->mlp_out[i].data, B_TT, H);
+        sv2_l2norm_bwd<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->grad_a.data, a->grad_a.data, a->mlp_out[i].data,
+            a->dots.data, a->mlp_norms[i].data, N_h, H);
+
+        puf_mm_tn(&a->grad_a, &a->after_relu[i], &a->wgrad_w2[i], stream);
+        puf_mm_nn(&a->grad_a, &nw->w2[i], &a->grad_h4, stream);
+
+        sv2_scale_relu_grad<<<H4, BLOCK_SIZE, 0, stream>>>(
+            a->sgrad[i].data, a->grad_h4.data, a->after_w1[i].data,
+            nw->mlp_scaler[i].data, nw->mlp_scaler_fwd, B_TT, H4);
+        sv2_scale_relu_bwd<<<grid_size(N_h4), BLOCK_SIZE, 0, stream>>>(
+            a->grad_h4.data, a->grad_h4.data, a->after_w1[i].data,
+            nw->mlp_scaler[i].data, nw->mlp_scaler_fwd, N_h4, H4);
+
+        puf_mm_tn(&a->grad_h4, input_i, &a->wgrad_w1[i], stream);
+        puf_mm_nn(&a->grad_h4, &nw->w1[i], &a->grad_a, stream);
+
+        add_kernel<<<grid_size(N_h), BLOCK_SIZE, 0, stream>>>(
+            a->grad_a.data, a->grad_b.data, N_h);
+
+        grad_in = a->grad_a;
+    }
+    return a->grad_a;
+}
+
+static void sv2_network_init_weights(void* w, ulong* seed, cudaStream_t stream) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    int H = nw->hidden, H4 = H * nw->expansion;
+    float scaler_val = sqrtf(2.0f / H) / sqrtf((float)nw->expansion);
+    float alpha_val = 1.0f / sqrtf((float)H);
+
+    for (int i = 0; i < nw->num_blocks; i++) {
+        puf_normal_init(&nw->w1[i], 1.0f, (*seed)++, stream);
+        puf_normal_init(&nw->w2[i], 1.0f, (*seed)++, stream);
+        fill_precision_kernel<<<grid_size(H4), BLOCK_SIZE, 0, stream>>>(
+            nw->mlp_scaler[i].data, from_float(scaler_val), H4);
+        fill_precision_kernel<<<grid_size(H), BLOCK_SIZE, 0, stream>>>(
+            nw->alpha[i].data, from_float(alpha_val), H);
+    }
+}
+
+static void sv2_network_reg_params(void* w, Allocator* alloc) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    int H = nw->hidden, H4 = H * nw->expansion;
+    for (int i = 0; i < nw->num_blocks; i++) {
+        nw->w1[i] =         {.shape = {H4, H}};
+        nw->mlp_scaler[i] = {.shape = {H4}};
+        nw->w2[i] =         {.shape = {H, H4}};
+        nw->alpha[i] =      {.shape = {H}};
+        alloc_register(alloc, &nw->w1[i]);
+        alloc_register(alloc, &nw->mlp_scaler[i]);
+        alloc_register(alloc, &nw->w2[i]);
+        alloc_register(alloc, &nw->alpha[i]);
+    }
+}
+
+static void sv2_network_reg_train(void* w, void* activations,
+        Allocator* acts, Allocator* grads, int B_TT) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    SV2NetworkActivations* a = (SV2NetworkActivations*)activations;
+    int H = nw->hidden, H4 = H * nw->expansion, nb = nw->num_blocks;
+    a->num_blocks = nb;
+
+    a->after_w1 =   (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+    a->after_relu =  (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+    a->mlp_out =     (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+    a->mlp_norms =   (FloatTensor*)calloc(nb, sizeof(FloatTensor));
+    a->block_out =   (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+    a->block_norms = (FloatTensor*)calloc(nb, sizeof(FloatTensor));
+    a->wgrad_w1 =    (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+    a->sgrad =       (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+    a->wgrad_w2 =    (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+    a->agrad =       (PrecisionTensor*)calloc(nb, sizeof(PrecisionTensor));
+
+    a->saved_input0 = {.shape = {B_TT, H}};
+    a->grad_a =       {.shape = {B_TT, H}};
+    a->grad_b =       {.shape = {B_TT, H}};
+    a->grad_h4 =      {.shape = {B_TT, H4}};
+    a->dots =          {.shape = {B_TT}};
+    alloc_register(acts, &a->saved_input0);
+    alloc_register(acts, &a->grad_a);
+    alloc_register(acts, &a->grad_b);
+    alloc_register(acts, &a->grad_h4);
+    alloc_register(acts, &a->dots);
+
+    for (int i = 0; i < nb; i++) {
+        a->after_w1[i] =   {.shape = {B_TT, H4}};
+        a->after_relu[i] = {.shape = {B_TT, H4}};
+        a->mlp_out[i] =    {.shape = {B_TT, H}};
+        a->mlp_norms[i] =  {.shape = {B_TT}};
+        a->block_out[i] =  {.shape = {B_TT, H}};
+        a->block_norms[i] ={.shape = {B_TT}};
+        alloc_register(acts, &a->after_w1[i]);
+        alloc_register(acts, &a->after_relu[i]);
+        alloc_register(acts, &a->mlp_out[i]);
+        alloc_register(acts, &a->mlp_norms[i]);
+        alloc_register(acts, &a->block_out[i]);
+        alloc_register(acts, &a->block_norms[i]);
+
+        a->wgrad_w1[i] = {.shape = {H4, H}};
+        a->sgrad[i] =    {.shape = {H4}};
+        a->wgrad_w2[i] = {.shape = {H, H4}};
+        a->agrad[i] =    {.shape = {H}};
+        alloc_register(grads, &a->wgrad_w1[i]);
+        alloc_register(grads, &a->sgrad[i]);
+        alloc_register(grads, &a->wgrad_w2[i]);
+        alloc_register(grads, &a->agrad[i]);
+    }
+}
+
+static void sv2_network_reg_rollout(void* w, void* activations,
+        Allocator* alloc, int B) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    SV2NetworkActivations* a = (SV2NetworkActivations*)activations;
+    int H = nw->hidden, H4 = H * nw->expansion;
+    a->num_blocks = nw->num_blocks;
+    a->temp_h4 = {.shape = {B, H4}};
+    a->temp_h =  {.shape = {B, H}};
+    a->out =     {.shape = {B, H}};
+    alloc_register(alloc, &a->temp_h4);
+    alloc_register(alloc, &a->temp_h);
+    alloc_register(alloc, &a->out);
+}
+
+static void* sv2_network_create_weights(void* self) {
+    Network* n = (Network*)self;
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)calloc(1, sizeof(SV2NetworkWeights));
+    nw->hidden = n->hidden;
+    nw->num_blocks = n->num_layers;
+    nw->horizon = n->horizon;
+    nw->expansion = n->expansion;
+    float scaler_init = sqrtf(2.0f / n->hidden) / sqrtf((float)n->expansion);
+    float scaler_scale = scaler_init;
+    nw->mlp_scaler_fwd = scaler_init / scaler_scale; // = 1.0
+    float alpha_init = 1.0f / (n->num_layers + 1);
+    float alpha_scale = 1.0f / sqrtf((float)n->hidden);
+    nw->alpha_fwd = alpha_init / alpha_scale;
+    nw->w1 =         (PrecisionTensor*)calloc(n->num_layers, sizeof(PrecisionTensor));
+    nw->mlp_scaler =  (PrecisionTensor*)calloc(n->num_layers, sizeof(PrecisionTensor));
+    nw->w2 =         (PrecisionTensor*)calloc(n->num_layers, sizeof(PrecisionTensor));
+    nw->alpha =       (PrecisionTensor*)calloc(n->num_layers, sizeof(PrecisionTensor));
+    return nw;
+}
+
+static void sv2_network_free_weights(void* w) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)w;
+    free(nw->w1); free(nw->mlp_scaler); free(nw->w2); free(nw->alpha);
+    free(nw);
+}
+
+static void sv2_network_free_activations(void* activations) {
+    SV2NetworkActivations* a = (SV2NetworkActivations*)activations;
+    free(a->after_w1); free(a->after_relu); free(a->mlp_out); free(a->mlp_norms);
+    free(a->block_out); free(a->block_norms);
+    free(a->wgrad_w1); free(a->sgrad); free(a->wgrad_w2); free(a->agrad);
+    free(a);
+}
+
+static inline void normalize_weight(PrecisionTensor& wt, int M, int N,
+        precision_t* param_base, float* master_weights, cudaStream_t stream) {
+    long offset = wt.data - param_base;
+    sv2_l2norm_weight_rows<<<M, BLOCK_SIZE, 0, stream>>>(master_weights + offset, M, N);
+}
+
+static void sv2_post_step(void* encoder_w, void* network_w,
+        precision_t* param_base, float* master_weights, cudaStream_t stream) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)encoder_w;
+    normalize_weight(ew->w, ew->out_dim, ew->in_dim + 1, param_base, master_weights, stream);
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)network_w;
+    int H = nw->hidden, H4 = H * nw->expansion;
+    for (int i = 0; i < nw->num_blocks; i++) {
+        normalize_weight(nw->w1[i], H4, H, param_base, master_weights, stream);
+        normalize_weight(nw->w2[i], H, H4, param_base, master_weights, stream);
+    }
+}
+
+static void sv2_network_only_post_step(void* encoder_w, void* network_w,
+        precision_t* param_base, float* master_weights, cudaStream_t stream) {
+    SV2NetworkWeights* nw = (SV2NetworkWeights*)network_w;
+    int H = nw->hidden, H4 = H * nw->expansion;
+    for (int i = 0; i < nw->num_blocks; i++) {
+        normalize_weight(nw->w1[i], H4, H, param_base, master_weights, stream);
+        normalize_weight(nw->w2[i], H, H4, param_base, master_weights, stream);
+    }
+}
+
+static void hyper_mingru_post_step(void* encoder_w, void* network_w,
+        precision_t* param_base, float* master_weights, cudaStream_t stream) {
+    SV2EncoderWeights* ew = (SV2EncoderWeights*)encoder_w;
+    normalize_weight(ew->w, ew->out_dim, ew->in_dim + 1, param_base, master_weights, stream);
+    MinGRUWeights* nw = (MinGRUWeights*)network_w;
+    int H = nw->hidden;
+    for (int i = 0; i < nw->num_layers; i++)
+        normalize_weight(nw->weights[i], 3 * H, H, param_base, master_weights, stream);
+}
+
 struct Policy {
     Encoder encoder;
     Decoder decoder;
     Network network;
     int input_dim, hidden_dim, output_dim;
     int num_atns;
+    policy_post_step_fn post_step;
 };
 
 struct PolicyActivations {
@@ -808,8 +1499,8 @@ PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
         Allocator* acts, Allocator* grads, int B_TT) {
     PolicyActivations a;
     a.encoder = calloc(1, p->encoder.activation_size);
-    a.decoder = calloc(1, sizeof(DecoderActivations));
-    a.network = calloc(1, sizeof(MinGRUActivations));
+    a.decoder = calloc(1, p->decoder.activation_size);
+    a.network = calloc(1, p->network.activation_size);
     p->encoder.reg_train(w.encoder, a.encoder, acts, grads, B_TT);
     p->decoder.reg_train(w.decoder, a.decoder, acts, grads, B_TT);
     p->network.reg_train(w.network, a.network, acts, grads, B_TT);
@@ -819,8 +1510,8 @@ PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
 PolicyActivations policy_reg_rollout(Policy* p, PolicyWeights& w, Allocator* acts, int B_inf) {
     PolicyActivations a;
     a.encoder = calloc(1, p->encoder.activation_size);
-    a.decoder = calloc(1, sizeof(DecoderActivations));
-    a.network = calloc(1, sizeof(MinGRUActivations));
+    a.decoder = calloc(1, p->decoder.activation_size);
+    a.network = calloc(1, p->network.activation_size);
     p->encoder.reg_rollout(w.encoder, a.encoder, acts, B_inf);
     p->decoder.reg_rollout(w.decoder, a.decoder, acts, B_inf);
     p->network.reg_rollout(w.network, a.network, acts, B_inf);
