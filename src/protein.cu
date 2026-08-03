@@ -392,9 +392,8 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         float ln_noise = logf(noise_val);
         float sig = softplus_grad(gp->raw_noise);
         float z = (ln_noise - NOISE_PRIOR_MU) / NOISE_PRIOR_SIGMA;
-        float np_grad = (-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val + 1.0f - sig;
-        loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)
-            - log1pf(expf(-gp->raw_noise)));
+        float np_grad = ((-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val) / n;
+        loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)) / n;
 
         (*opt_t)++;
         float bc1 = 1.0f - powf(beta1, (*opt_t));
@@ -592,6 +591,55 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->kd_keep = (int *)malloc(kd_cap * sizeof(int));
     cudaStreamCreate(&sw->stream);
     return sw;
+}
+
+static void gp_cleanup(GaussianProcess *gp) {
+    cudaFree(gp->d_X);
+    cudaFree(gp->d_y);
+    cudaFree(gp->d_L);
+    cudaFree(gp->d_alpha);
+    cudaFree(gp->d_info);
+    cudaFree(gp->d_inv_ells);
+    cudaFree(gp->d_diag);
+    cudaFree(gp->d_Kinv);
+    cudaFree(gp->d_partials);
+    cudaFree(gp->d_Ks);
+    cudaFree(gp->d_work);
+    free(gp->kernel);
+    free(gp->h_kg);
+    free(gp->h_diag);
+    free(gp->h_partials);
+    cublasDestroy(gp->cublas);
+    cusolverDnDestroy(gp->cusolver);
+}
+
+void protein_sweep_destroy(ProteinSweep *sw) {
+    gp_cleanup(&sw->gp_score);
+    gp_cleanup(&sw->gp_cost);
+    curandDestroyGenerator(sw->sobol);
+    cudaStreamDestroy(sw->stream);
+    cudaFree(sw->d_scales);
+    cudaFree(sw->d_candidates);
+    cudaFree(sw->d_pred_y);
+    cudaFree(sw->d_rng);
+    cudaFree(sw->d_centers);
+    free(sw->succ_params);
+    free(sw->fail_params);
+    free(sw->top_idx);
+    free(sw->clf_w);
+    free(sw->opt_m);
+    free(sw->gp_train_params);
+    free(sw->pareto_buf);
+    free(sw->centers_buf);
+    free(sw->log_c_buf);
+    free(sw->ext_buf);
+    free(sw->kept_buf);
+    free(sw->h_cands);
+    free(sw->h_pred);
+    free(sw->kd_idx);
+    free(sw->kd_nodes);
+    free(sw->kd_keep);
+    free(sw);
 }
 
 static float logit_transform(float value) {
