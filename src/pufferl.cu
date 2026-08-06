@@ -2544,6 +2544,8 @@ void rollouts(PuffeRL* p) {
     p->global_step += p->hypers.horizon * p->hypers.total_agents;
 }
 
+#include "bc.cu"
+
 typedef struct {
     float score;
     float draw;
@@ -3390,7 +3392,7 @@ int main(int argc, char** argv) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
     if (argc < 3) {
-        fprintf(stderr, "usage: %s train|eval|match|sweep ENV [section.key=value ...]\n", argv[0]);
+        fprintf(stderr, "usage: %s train|eval|match|sweep|clone ENV [section.key=value ...]\n", argv[0]);
         exit(1);
     }
     int total_gpus = 0;
@@ -3410,8 +3412,10 @@ int main(int argc, char** argv) {
         run_eval(&ini, &ctx, EVAL_SCORE, 1);
     } else if (strcmp(mode, "match") == 0) {
         run_eval(&ini, &ctx, EVAL_MATCH, 1);
+    } else if (strcmp(mode, "clone") == 0) {
+        run_clone(&ini, &ctx);
     } else {
-        assert(0 && "unknown mode (train|eval|match|sweep)");
+        assert(0 && "unknown mode (train|eval|match|sweep|clone)");
     }
 
     puf_ini_free(&ini);
