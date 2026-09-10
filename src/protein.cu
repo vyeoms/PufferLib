@@ -26,6 +26,7 @@
 #define SF_IDX(np) ((np)-2)
 #define OFF_IDX(np) ((np)-1)
 #define GP_BLOCK 16
+#define GP_HUTCH_PROBES 8
 #define KD_LEAF 16
 
 typedef enum {
@@ -130,12 +131,16 @@ __global__ void matern32lin_k_kernel(const float *__restrict__ X1,
     K[col * n + row] = val;
 }
 
-// Write constant onto diagonal (stride n+1). Used to form I for spotrs → K^{-1}.
-__global__ void gp_k_set_diag(float *A, int n, float val) {
+// Fill Z[0..total) with ±1 Rademacher probes. Resampled each Adam iter via counter.
+__global__ void gp_fill_rademacher(float *Z, int total,
+        unsigned long long seed, unsigned long long counter) {
     int i = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (i < n) {
-        A[i * (n + 1)] = val;
+    if (i >= total) {
+        return;
     }
+    curandStatePhilox4_32_10_t st;
+    curand_init(seed, i, counter, &st);
+    Z[i] = (curand_uniform(&st) < 0.5f) ? -1.0f : 1.0f;
 }
 
 // Copy matrix diagonal (stride n+1) to a dense vector (L_ii for host logdet).
@@ -146,13 +151,15 @@ __global__ void gp_k_extract_diag(const float *A, float *d, int n) {
     }
 }
 
-// Fused MLL kernel grads: per (i,j) W=ααᵀ−K⁻¹ terms for ∂/∂ℓ, ∂/∂σ_f, ∂/∂offset.
+// Fused MLL kernel grads: per (i,j) W=ααᵀ−(K⁻¹)_{ij} terms for ∂/∂ℓ, ∂/∂σ_f, ∂/∂offset.
+// (K⁻¹)_{ij} is the Hutchinson estimate (1/P)Σ_p Z_ip U_jp with U=K⁻¹Z (symmetrized),
+// so no dense inverse is formed. Summing W_ij (∂K/∂θ)_ij gives αᵀ(∂K/∂θ)α − tr(K⁻¹ ∂K/∂θ).
 // Block partials via block_reduce_sum into out_partials[bid * (d+2) + ·]; host folds
 // in fixed block order. Dynamic smem: (d+2) * GP_BLOCK² floats.
 __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
-        const float *__restrict__ alpha, const float *__restrict__ Kinv,
-        const float *__restrict__ inv_ells, int n, int d, float sigma_f,
-        float offset, float *__restrict__ out_partials) {
+        const float *__restrict__ alpha, const float *__restrict__ Z,
+        const float *__restrict__ U, const float *__restrict__ inv_ells, int n,
+        int d, int P, float sigma_f, float offset, float *__restrict__ out_partials) {
     extern __shared__ float sh[];
     int col = blockIdx.x * GP_BLOCK + threadIdx.x;
     int row = blockIdx.y * GP_BLOCK + threadIdx.y;
@@ -173,7 +180,12 @@ __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
         }
         float u = sqrtf(3.0f) * sqrtf(r2);
         float e = expf(-u);
-        float W = alpha[row] * alpha[col] - Kinv[col * n + row];
+        float hutch = 0.0f;
+        for (int p = 0; p < P; p++) {
+            hutch += 0.5f * (Z[p * n + row] * U[p * n + col]
+                + U[p * n + row] * Z[p * n + col]);
+        }
+        float W = alpha[row] * alpha[col] - hutch / P;
         for (int dd = 0; dd < d; dd++) {
             float diff = X[row * d + dd] - X[col * d + dd];
             float inv = inv_ells[dd];
@@ -197,7 +209,9 @@ typedef struct {
     cublasHandle_t cublas;
     cusolverDnHandle_t cusolver;
     GPKernel *kernel;
-    float *d_inv_ells, *d_diag, *d_Kinv, *d_partials, *d_Ks, *d_ones;
+    float *d_inv_ells, *d_diag, *d_partials, *d_Ks, *d_ones;
+    float *d_Z, *d_U;
+    unsigned long long hutch_seed;
     float *h_kg, *h_diag, *h_partials;
 } GaussianProcess;
 
@@ -243,7 +257,9 @@ static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noi
     cudaMalloc(&gp->d_info, sizeof(int));
     cudaMalloc(&gp->d_inv_ells, dim * sizeof(float));
     cudaMalloc(&gp->d_diag, cap * sizeof(float));
-    cudaMalloc(&gp->d_Kinv, cap * cap * sizeof(float));
+    cudaMalloc(&gp->d_Z, cap * GP_HUTCH_PROBES * sizeof(float));
+    cudaMalloc(&gp->d_U, cap * GP_HUTCH_PROBES * sizeof(float));
+    gp->hutch_seed = 0x9E3779B97F4A7C15ULL;
     cudaMalloc(&gp->d_partials, nblocks * nsum * sizeof(float));
     // Dominant device buffer: cap × acq_cap floats (×2 GPs)
     assert(cudaMalloc(&gp->d_Ks, cap * pred_m * sizeof(float)) == cudaSuccess);
@@ -322,8 +338,13 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
     int n_opt = n_kp + 2;
     int d = gp->dim;
     int nsum = d + 2;
+    int P = GP_HUTCH_PROBES;
     float loss = 0.0f;
     const float beta1 = 0.9f, beta2 = 0.999f;
+    // Dimension-scaled log-normal prior on each lengthscale (Hvarfner et al., ICML 2024):
+    // Normal on log ℓ, mean shifted by +½ log D. Mirrors how the noise prior is folded in.
+    float ls_mu = 1.4142135f + 0.5f * logf((float)d);
+    float ls_sigma = 1.7320508f;
 
     for (int iter = 0; iter < training_iter; iter++) {
         if (gp_recompute(gp, stream) != 0) {
@@ -341,16 +362,24 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
             BLOCK_SIZE, 0, stream>>>(gp->d_L, gp->d_diag, n);
         cudaMemcpyAsync(gp->h_diag, gp->d_diag, n * sizeof(float),
             cudaMemcpyDeviceToHost, stream);
-        cudaMemsetAsync(gp->d_Kinv, 0, n * n * sizeof(float), stream);
-        gp_k_set_diag<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            gp->d_Kinv, n, 1.0f);
-        cusolverDnSetStream(gp->cusolver, stream);
-        cusolverDnSpotrs(gp->cusolver, CUBLAS_FILL_MODE_LOWER, n, n, gp->d_L, n,
-            gp->d_Kinv, n, gp->d_info);
-        float term1, term2;
+
+        // Hutchinson traces: U = K^{-1} Z with Z Rademacher, via two triangular solves
+        // against L. tr(K^{-1}) ≈ (1/P)<Z, U>; tr(K^{-1} ∂K/∂θ) contracted in the fused kernel.
+        int total = n * P;
+        gp_fill_rademacher<<<(total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            gp->d_Z, total, gp->hutch_seed, (unsigned long long)(*opt_t));
+        cudaMemcpyAsync(gp->d_U, gp->d_Z, total * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream);
+        float one = 1.0f;
+        cublasStrsm(gp->cublas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+            CUBLAS_DIAG_NON_UNIT, n, P, &one, gp->d_L, n, gp->d_U, n);
+        cublasStrsm(gp->cublas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
+            CUBLAS_DIAG_NON_UNIT, n, P, &one, gp->d_L, n, gp->d_U, n);
+        float term1, trace_est;
         cublasSdot(gp->cublas, n, gp->d_alpha, 1, gp->d_alpha, 1, &term1);
-        cublasSasum(gp->cublas, n, gp->d_Kinv, n + 1, &term2);
-        float d_noise = 0.5f * (term1 - term2) * softplus_grad(gp->raw_noise) / n;
+        cublasSdot(gp->cublas, total, gp->d_Z, 1, gp->d_U, 1, &trace_est);
+        trace_est /= (float)P;
+        float d_noise = 0.5f * (term1 - trace_est) * softplus_grad(gp->raw_noise) / n;
 
         float sigma_f = softplus(k->raw_params[SF_IDX(np)]);
         float offset = softplus(k->raw_params[OFF_IDX(np)]);
@@ -364,8 +393,8 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         int nblocks = g.x * g.y;
         int nthreads = GP_BLOCK * GP_BLOCK;
         matern32lin_mll_grad_fuse<<<g, b, nsum * nthreads * sizeof(float), stream>>>(
-            gp->d_X, gp->d_alpha, gp->d_Kinv, gp->d_inv_ells, n, d, sigma_f,
-            offset, gp->d_partials);
+            gp->d_X, gp->d_alpha, gp->d_Z, gp->d_U, gp->d_inv_ells, n, d, P,
+            sigma_f, offset, gp->d_partials);
         cudaMemcpyAsync(gp->h_partials, gp->d_partials,
             nblocks * nsum * sizeof(float), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
@@ -384,8 +413,15 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
             }
         }
         float inv_n = 0.5f / n;
+        float ls_prior = 0.0f;
         for (int dd = 0; dd < d; dd++) {
             gp->h_kg[dd] = inv_n * h_sums[dd] * softplus_grad(k->raw_params[dd]);
+            float ell = softplus(k->raw_params[dd]);
+            float ln_ell = logf(ell);
+            float zl = (ln_ell - ls_mu) / ls_sigma;
+            gp->h_kg[dd] += ((-zl / ls_sigma - 1.0f)
+                * softplus_grad(k->raw_params[dd]) / ell) / n;
+            ls_prior += -0.5f * zl * zl - ln_ell - logf(ls_sigma);
         }
         gp->h_kg[SF_IDX(np)] =
             inv_n * h_sums[d] * softplus_grad(k->raw_params[SF_IDX(np)]);
@@ -398,7 +434,8 @@ static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
         float sig = softplus_grad(gp->raw_noise);
         float z = (ln_noise - NOISE_PRIOR_MU) / NOISE_PRIOR_SIGMA;
         float np_grad = ((-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val) / n;
-        loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)) / n;
+        loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)) / n
+            - ls_prior / n;
 
         (*opt_t)++;
         float bc1 = 1.0f - powf(beta1, (*opt_t));
