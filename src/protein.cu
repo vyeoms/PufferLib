@@ -16,10 +16,8 @@
 #define PROTEIN_ACQ_MAX_CAP 65536
 #define PROTEIN_COST_QUANTILE 0.97f
 #define PROTEIN_MIN_OBS_NO_FAIL 100
-#define PROTEIN_COST_GROWTH 1.01f
 #define PROTEIN_CLF_ITERS 100
-#define PROTEIN_THRESHOLD_COST_CAP 1.2f
-#define PROTEIN_THRESHOLD_FALLBACK 0.9f
+#define PROTEIN_STOP_MIN_RUNS 8
 #define NOISE_PRIOR_MU (-4.60517f)
 #define NOISE_PRIOR_SIGMA 0.5f
 #define SP_LB 1e-4
@@ -492,7 +490,7 @@ typedef struct {
     float max_suggestion_cost;
     float expansion_rate;
     float cost_random_suggestion;
-    float early_stop_quantile;
+    float early_stop_frac;
     int success_cap;
     int failure_cap;
     int top_k;
@@ -500,14 +498,13 @@ typedef struct {
     // Internal
     float *succ_params, *succ_scores, *succ_costs;
     float *fail_params, *fail_scores, *fail_costs;
-    int succ_n, fail_n, n_top, dim, cost_dim;
+    float *check_scores, *check_costs, *check_finals, *check_front;
+    int succ_n, fail_n, check_n, dim, cost_dim;
     int *top_idx;
     float min_score, max_score, log_c_min, log_c_max;
     int acq_cap;
     float *d_scales, *d_candidates, *d_pred_y, *d_pred_c;
     curandStatePhilox4_32_10_t *d_rng;
-    float cm_A, cm_B, cm_max_score, cm_upper;
-    int cm_min_samples, cm_fitted;
     float *clf_w, clf_bias;
     int clf_fitted;
     GaussianProcess gp_score, gp_cost;
@@ -516,13 +513,12 @@ typedef struct {
     curandGenerator_t sobol;
     cudaStream_t stream;
     int suggestion_idx;
-    float upper_cost_threshold;
     float ratio_pool[PROTEIN_NUM_COST_RATIOS];
     int pool_remaining;
     float *gp_train_params, *gp_train_y, *gp_train_c;
     int *pareto_buf, *pruned_buf;
     float *centers_buf;
-    // suggest scratch (sized to caps; ext_buf/kept_buf also pinball + classifier)
+    // suggest scratch (sized to caps; ext_buf/kept_buf also classifier)
     float *log_c_buf, *ext_buf, *h_cands, *h_pred;
     int *kept_buf, *kd_idx, *kd_keep;
     KDNode *kd_nodes;
@@ -535,17 +531,14 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     int dim = sw->space->num;
     sw->dim = dim;
     sw->cost_dim = sw->space->cost_idx;
-    sw->succ_n = sw->fail_n = sw->n_top = sw->suggestion_idx = 0;
-    sw->cm_fitted = sw->clf_fitted = sw->pool_remaining = 0;
     sw->opt_t_score = sw->opt_t_cost = 0;
-    sw->upper_cost_threshold = -FLT_MAX;
-    sw->cm_min_samples = 30;
+    sw->succ_n = sw->fail_n = sw->check_n = sw->suggestion_idx = 0;
+    sw->clf_fitted = sw->pool_remaining = 0;
     sw->min_score = FLT_MAX;
     sw->max_score = -FLT_MAX;
     sw->log_c_min = FLT_MAX;
     sw->log_c_max = -FLT_MAX;
     sw->clf_bias = 0.0f;
-    sw->cm_A = sw->cm_B = sw->cm_max_score = sw->cm_upper = 0.0f;
 
     static const float default_ratios[PROTEIN_NUM_COST_RATIOS] = {
         0.16f, 0.32f, 0.48f, 0.64f, 0.8f, 1.0f};
@@ -557,6 +550,10 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->fail_params = (float *)calloc(sw->failure_cap * (dim + 2), sizeof(float));
     sw->fail_scores = sw->fail_params + sw->failure_cap * dim;
     sw->fail_costs = sw->fail_scores + sw->failure_cap;
+    sw->check_scores = (float *)malloc(4 * sw->success_cap * sizeof(float));
+    sw->check_costs = sw->check_scores + sw->success_cap;
+    sw->check_finals = sw->check_costs + sw->success_cap;
+    sw->check_front = sw->check_finals + sw->success_cap;
     sw->top_idx = (int *)malloc(sw->top_k * sizeof(int));
 
     int max_centers = sw->success_cap + 3 * sw->top_k;
@@ -652,43 +649,6 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
     memcpy(&sw->succ_params[idx * dim], norm_params, dim * sizeof(float));
     sw->succ_scores[idx] = score;
     sw->succ_costs[idx] = cost;
-    if (sw->n_top >= sw->top_k
-            && score <= sw->succ_scores[sw->top_idx[sw->n_top - 1]]) {
-        return;
-    }
-    if (sw->n_top < sw->top_k) {
-        sw->top_idx[sw->n_top++] = idx;
-    } else {
-        sw->top_idx[sw->n_top - 1] = idx;
-    }
-    for (int j = sw->n_top - 1; j > 0; j--) {
-        if (sw->succ_scores[sw->top_idx[j]] <= sw->succ_scores[sw->top_idx[j - 1]]) {
-            break;
-        }
-        int tmp = sw->top_idx[j];
-        sw->top_idx[j] = sw->top_idx[j - 1];
-        sw->top_idx[j - 1] = tmp;
-    }
-}
-
-int protein_sweep_should_stop(const ProteinSweep *sw, float score, float cost) {
-    if (sw->use_logit) {
-        score = logit_transform(score);
-    }
-    if (!sw->cm_fitted) {
-        return 0;
-    }
-    float min_allowed = sw->cm_upper * 0.3f + 10.0f;
-    if (cost < min_allowed) {
-        return 0;
-    }
-    float threshold;
-    if (cost > PROTEIN_THRESHOLD_COST_CAP * sw->cm_upper) {
-        threshold = PROTEIN_THRESHOLD_FALLBACK * sw->cm_max_score;
-    } else {
-        threshold = sw->cm_A + sw->cm_B * logf(cost);
-    }
-    return score < threshold;
 }
 
 static float noise01(void) {
@@ -826,14 +786,53 @@ static int float_cmp(const void *a, const void *b) {
     return (fa > fb) - (fa < fb);
 }
 
-static float pinball(float a, float b, const float *x,
-        const float *y, int n, float q) {
-    float loss = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float r = y[i] - (a + b * x[i]);
-        loss += (r > 0.0f) ? q * r : (q - 1.0f) * r;
+// Score a run must reach by early_stop_frac of its steps to continue: the lowest check of the runs
+// within a factor of 2 of its cost that went on to improve the front, so a run is stopped only when
+// no similar-cost run that looked this bad ever mattered. -FLT_MAX never stops.
+float protein_sweep_stop_score(ProteinSweep *sw, float cost) {
+    float th = FLT_MAX;
+    int n = 0;
+    for (int i = 0; i < sw->check_n; i++) {
+        if (fabsf(logf(sw->check_costs[i] / cost)) < (float)M_LN2) {
+            n++;
+            th = sw->check_front[i] ? fminf(th, sw->check_scores[i]) : th;
+        }
     }
-    return loss;
+    if (n < PROTEIN_STOP_MIN_RUNS || th == FLT_MAX || sw->early_stop_frac <= 0.0f) {
+        return -FLT_MAX;
+    }
+    return th;
+}
+
+// Final score for a stopped run: that of the finished similar-cost run with the same rank at the
+// check, since a partial score would understate the config to the GP.
+float protein_sweep_stop_estimate(ProteinSweep *sw, float check, float cost) {
+    float *finals = sw->log_c_buf;
+    int n = 0, below = 0;
+    for (int i = 0; i < sw->check_n; i++) {
+        int near = fabsf(logf(sw->check_costs[i] / cost)) < (float)M_LN2;
+        if (near && isfinite(sw->check_finals[i])) {
+            finals[n++] = sw->check_finals[i];
+            below += sw->check_scores[i] < check;
+        }
+    }
+    if (!n) {
+        return check;
+    }
+    qsort(finals, n, sizeof(float), float_cmp);
+    return finals[min(below, n - 1)];
+}
+
+// final is NAN for a stopped run
+void protein_sweep_observe_check(ProteinSweep *sw, float check, float cost, float final) {
+    int front = isfinite(final);
+    for (int i = 0; i < sw->check_n && front; i++) {
+        front = !(sw->check_costs[i] <= cost && sw->check_finals[i] >= final);
+    }
+    sw->check_front[sw->check_n] = front;
+    sw->check_scores[sw->check_n] = check;
+    sw->check_costs[sw->check_n] = cost;
+    sw->check_finals[sw->check_n++] = final;
 }
 
 static const float *g_pareto_costs;
@@ -989,118 +988,23 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         }
     }
 
-    if (n_pruned > 0) {
-        float pruned_max_cost = sw->succ_costs[sw->pruned_buf[n_pruned - 1]];
-        if (sw->upper_cost_threshold < 0) {
-            sw->upper_cost_threshold = pruned_max_cost;
-        } else if (pruned_max_cost > sw->upper_cost_threshold) {
-            sw->upper_cost_threshold *= PROTEIN_COST_GROWTH;
-        }
-    }
-
-    // Cost model fit (pinball NM)
-    sw->cm_fitted = 0;
-    sw->cm_max_score = max_score;
-    sw->cm_upper = sw->upper_cost_threshold;
-    int n_valid = 0;
-    for (int i = 0; i < sw->succ_n; i++) {
-        if (sw->succ_costs[i] > PROTEIN_EPSILON && isfinite(sw->succ_scores[i])) {
-            n_valid++;
-        }
-    }
-    if (n_valid >= sw->cm_min_samples) {
-        float *x = sw->ext_buf;
-        float *y = x + n_valid;
-        int j = 0;
-        for (int i = 0; i < sw->succ_n; i++) {
-            if (sw->succ_costs[i] > PROTEIN_EPSILON && isfinite(sw->succ_scores[i])) {
-                x[j] = logf(sw->succ_costs[i]);
-                y[j] = sw->succ_scores[i];
-                j++;
-            }
-        }
-        float sx = 0, sy = 0, sxx = 0, sxy = 0;
-        for (int i = 0; i < n_valid; i++) {
-            sx += x[i];
-            sy += y[i];
-            sxx += x[i] * x[i];
-            sxy += x[i] * y[i];
-        }
-        float det = n_valid * sxx - sx * sx;
-        float a_init = sy / fmaxf(n_valid, 1.0f), b_init = 0.0f;
-        if (fabsf(det) >= 1e-10f) {
-            b_init = (n_valid * sxy - sx * sy) / det;
-            a_init = (sy - b_init * sx) / n_valid;
-        }
-        float q = sw->early_stop_quantile;
-        float nm_x[3] = {a_init, a_init + 0.05f, a_init - 0.05f};
-        float nm_y[3] = {b_init, b_init - 0.05f, b_init + 0.05f};
-        float nm_v[3];
-        for (int i = 0; i < 3; i++) {
-            nm_v[i] = pinball(nm_x[i], nm_y[i], x, y, n_valid, q);
-        }
-        for (int iter = 0; iter < 500; iter++) {
-            for (int i = 0; i < 2; i++) {
-                for (int jj = i + 1; jj < 3; jj++) {
-                    if (nm_v[jj] < nm_v[i]) {
-                        float t;
-                        t = nm_x[i]; nm_x[i] = nm_x[jj]; nm_x[jj] = t;
-                        t = nm_y[i]; nm_y[i] = nm_y[jj]; nm_y[jj] = t;
-                        t = nm_v[i]; nm_v[i] = nm_v[jj]; nm_v[jj] = t;
-                    }
-                }
-            }
-            if (fabsf(nm_v[2] - nm_v[0]) < 1e-7f) {
-                break;
-            }
-            float cx = (nm_x[0] + nm_x[1]) * 0.5f;
-            float cy = (nm_y[0] + nm_y[1]) * 0.5f;
-            float rx = cx + (cx - nm_x[2]), ry = cy + (cy - nm_y[2]);
-            float rv = pinball(rx, ry, x, y, n_valid, q);
-            if (rv < nm_v[1] && rv >= nm_v[0]) {
-                nm_x[2] = rx;
-                nm_y[2] = ry;
-                nm_v[2] = rv;
-                continue;
-            }
-            if (rv < nm_v[0]) {
-                float ex = cx + 2.0f * (rx - cx);
-                float ey = cy + 2.0f * (ry - cy);
-                float ev = pinball(ex, ey, x, y, n_valid, q);
-                if (ev >= rv) {
-                    ex = rx;
-                    ey = ry;
-                    ev = rv;
-                }
-                nm_x[2] = ex;
-                nm_y[2] = ey;
-                nm_v[2] = ev;
-                continue;
-            }
-            float ccx = (rv < nm_v[2])
-                ? cx + 0.5f * (rx - cx) : cx + 0.5f * (nm_x[2] - cx);
-            float ccy = (rv < nm_v[2])
-                ? cy + 0.5f * (ry - cy) : cy + 0.5f * (nm_y[2] - cy);
-            float ccv = pinball(ccx, ccy, x, y, n_valid, q);
-            if (ccv < nm_v[2]) {
-                nm_x[2] = ccx;
-                nm_y[2] = ccy;
-                nm_v[2] = ccv;
-                continue;
-            }
-            for (int i = 1; i < 3; i++) {
-                nm_x[i] = nm_x[0] + 0.5f * (nm_x[i] - nm_x[0]);
-                nm_y[i] = nm_y[0] + 0.5f * (nm_y[i] - nm_y[0]);
-                nm_v[i] = pinball(nm_x[i], nm_y[i], x, y, n_valid, q);
-            }
-        }
-        sw->cm_A = nm_x[0];
-        sw->cm_B = nm_y[0];
-        sw->cm_fitted = 1;
-    }
-
     int *use_pareto = sw->prune_pareto ? sw->pruned_buf : sw->pareto_buf;
     int n_use = sw->prune_pareto ? n_pruned : n_pareto;
+
+    // Top-k by score
+    int n_top = 0;
+    for (int i = 0; i < sw->succ_n; i++) {
+        int j = n_top;
+        while (j > 0 && sw->succ_scores[i] > sw->succ_scores[sw->top_idx[j - 1]]) {
+            j--;
+        }
+        if (j == sw->top_k) {
+            continue;
+        }
+        n_top = min(n_top + 1, sw->top_k);
+        memmove(&sw->top_idx[j + 1], &sw->top_idx[j], (n_top - 1 - j) * sizeof(int));
+        sw->top_idx[j] = i;
+    }
 
     // Search centers
     int n_centers = 0;
@@ -1111,7 +1015,7 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     float divisors[] = {2.0f, 3.0f};
     int n_shift = (cost_dim >= 0) ? 2 : 1;
     for (int r = 0; r < n_shift; r++) {
-        for (int i = 0; i < sw->n_top; i++) {
+        for (int i = 0; i < n_top; i++) {
             const float *src = &sw->succ_params[sw->top_idx[i] * dim];
             float *dst = &sw->centers_buf[n_centers * dim];
             memcpy(dst, src, dim * sizeof(float));

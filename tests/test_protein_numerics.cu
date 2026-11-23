@@ -210,7 +210,7 @@ static void section_sweep(void) {
         .max_suggestion_cost = 1e9f,
         .expansion_rate = 0.05f,
         .cost_random_suggestion = 0.0f,
-        .early_stop_quantile = 0.3f,
+        .early_stop_frac = 0.2f,
         .success_cap = 128,
         .failure_cap = 64,
         .top_k = 5,
@@ -255,18 +255,14 @@ static void section_sweep(void) {
         int fail = (score < -0.8f) || (step == 12);
         protein_sweep_observe(sw, suggestion, score, cost, fail);
 
-        int stop = protein_sweep_should_stop(sw, score * 0.5f, cost);
-        snprintf(buf, sizeof(buf), "%s.stop", pref);
-        rec_i(buf, stop);
+        protein_sweep_observe_check(sw, score * 0.5f, cost, fail ? NAN : score);
+        snprintf(buf, sizeof(buf), "%s.stop_score", pref);
+        rec_f(buf, protein_sweep_stop_score(sw, cost));
     }
 
     rec_i("sw.final_n_success", sw->succ_n);
     rec_i("sw.final_n_failure", sw->fail_n);
-    rec_i("sw.final_n_top", sw->n_top);
-    rec_f("sw.upper_cost_thr", sw->upper_cost_threshold);
-    rec_f("sw.cm.A", sw->cm_A);
-    rec_f("sw.cm.B", sw->cm_B);
-    rec_i("sw.cm.fitted", sw->cm_fitted);
+    rec_i("sw.final_n_check", sw->check_n);
 
     ProteinSweepInfo info = protein_sweep_suggest(sw, suggestion, 0.0f);
     rec_i("sw.fixed.is_random", info.is_random);

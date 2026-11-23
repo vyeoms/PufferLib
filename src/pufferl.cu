@@ -2499,6 +2499,8 @@ typedef struct {
     float score;
     float cost;
     float steps;
+    float check_score;
+    int stopped;
     int points;
     float scores[TRAIN_RESULT_MAX_POINTS];
     float costs[TRAIN_RESULT_MAX_POINTS];
@@ -2639,7 +2641,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
         && "sweep.metric_distribution must be linear or logit");
     int use_logit = strcmp(metric_dist, "logit") == 0;
     float max_cost = puf_ini_get(ini, "sweep", "max_suggestion_cost");
-    float early_stop_quantile = puf_ini_get(ini, "sweep", "early_stop_quantile");
+    float early_stop_frac = puf_ini_get(ini, "sweep", "early_stop_frac");
     assert(max_runs >= 1 && "sweep.max_runs must be >= 1");
     assert(downsample >= 1 && downsample <= TRAIN_RESULT_MAX_POINTS
         && "sweep.downsample must be in [1, TRAIN_RESULT_MAX_POINTS]");
@@ -2674,7 +2676,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .max_suggestion_cost = max_cost,
         .expansion_rate = 0.1f,
         .cost_random_suggestion = -0.8f,
-        .early_stop_quantile = early_stop_quantile,
+        .early_stop_frac = early_stop_frac,
         .success_cap = success_cap,
         .failure_cap = 1024,
         .top_k = 5,
@@ -2748,6 +2750,13 @@ void run_sweep(Ini* ini, const char* exe_path) {
             puf_ini_put(ini, "base.gpu_offset", buf);
             snprintf(buf, sizeof(buf), "%d", pipefd[1]);
             puf_ini_put(ini, "base.result_fd", buf);
+            // Early stop maximize-goal GP runs only; ranks of a multi-GPU trial can't stop alone
+            float stop_score = -FLT_MAX;
+            if (info.predicted_cost > 0 && train_gpus == 1 && space->optimize_direction > 0) {
+                stop_score = protein_sweep_stop_score(protein, info.predicted_cost);
+            }
+            snprintf(buf, sizeof(buf), "%.9g", stop_score);
+            puf_ini_put(ini, "base.stop_score", buf);
 
             int nkeys = 0;
             for (int s = 0; s < ini->num_sections; s++) {
@@ -2824,14 +2833,20 @@ void run_sweep(Ini* ini, const char* exe_path) {
             assert(++failed_workers <= 1000 && "too many failed sweep workers");
             continue;
         }
-        // points[]: learning-curve downsample, or 1 final score (e.g. selfplay).
-        for (int pi = 0; pi < job->result.points; pi++) {
-            protein_sweep_observe(protein, job->sample,
-                job->result.scores[pi], job->result.costs[pi], 0);
+        TrainResult* res = &job->result;
+        int last = res->points - 1;
+        float cost = res->costs[last], final = res->stopped ? NAN : res->scores[last];
+        float score = final;
+        if (!isfinite(final)) {  // stopped: planned cost, rank-matched final estimate
+            score = protein_sweep_stop_estimate(protein, res->check_score, cost);
         }
-        printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f random=%d gp_obs=%d pareto=%d\n",
-            job->run, job->result.score, job->result.cost, job->result.steps,
-            job->random, job->gp_obs, job->pareto);
+        protein_sweep_observe(protein, job->sample, score, cost, 0);
+        if (isfinite(res->check_score)) {
+            protein_sweep_observe_check(protein, res->check_score, cost, final);
+        }
+        printf("sweep run=%d score=%.4f cost=%.2f steps=%.0f random=%d gp_obs=%d pareto=%d"
+            " stopped=%d\n", job->run, res->score, res->cost, res->steps, job->random,
+            job->gp_obs, job->pareto, res->stopped);
         completed++;
     }
 }
@@ -3059,13 +3074,15 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long local_timesteps = total_timesteps / ctx->world_size;
     long train_epochs = local_timesteps / batch_size;
     long checkpoint_interval = puf_ini_get(ini, "base", "checkpoint_interval");
+    long check_step = puf_ini_get(ini, "sweep", "early_stop_frac") * local_timesteps;
+    float stop_score = puf_ini_get(ini, "base", "stop_score");
     char target_key[128];
     sweep_metric_key(ini, target_key, sizeof(target_key));
     Dict last_log = {0};
     // At most one history entry per train epoch (+1 final snapshot for log dump).
     PufLogHistory log_history;
     puf_log_history_init(&log_history, (int)train_epochs + 1);
-    TrainResult result = {0};
+    TrainResult result = {.check_score = NAN};
     char final_checkpoint[4096] = {0};
 
     for (long epoch = 0; epoch < train_epochs; epoch++) {
@@ -3201,6 +3218,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         // Wait until the objective appears; do not treat negative values as missing.
         if (episodes && dict_find(&new_log, target_key)) {
             puf_log_history_add(&log_history, &last_log);
+            if (!use_selfplay && isnan(result.check_score) && global_step >= check_step) {
+                result.check_score = dict_get(&new_log, target_key);
+                if (result.check_score < stop_score) {
+                    result.stopped = 1;
+                    train_epochs = min(train_epochs, epoch + 2);  // +2 lets async finish its slot
+                }
+            }
         }
         dict_clear(&new_log);
     }
@@ -3236,6 +3260,10 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         result.costs[points - 1] = result.cost;
         result.step_points[points - 1] = result.steps;
     }
+    // A stopped run reports its planned cost, so the cost GP isn't told the config is cheap
+    if (result.stopped) {
+        result.costs[points - 1] = result.cost * total_timesteps / result.steps;
+    }
 
     long bot_games = use_selfplay ? puf_ini_get(ini, "selfplay", "eval_bot_games") : 0;
     int max_opp = use_selfplay ? puf_ini_get(ini, "selfplay", "eval_pool_size") : 0;
@@ -3254,7 +3282,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     // (and previously poisoned rank-0 CUDA graphs if children exited early).
     close_pufferl(pufferl);
     if (ctx->artifact_owner && !bot_ladder && !pool_eval && eval_episodes > 0
-            && eval_ckpt[0]) {
+            && eval_ckpt[0] && !result.stopped) {
         puf_ini_put(ini, "base.load_model_path", eval_ckpt);
         TrainContext eval_ctx = {
             .rank = 0,
