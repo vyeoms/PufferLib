@@ -2678,7 +2678,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .success_cap = success_cap,
         .failure_cap = 1024,
         .top_k = 5,
-        .rng_seed = 73ULL,
+        .rng_seed = puf_ini_get(ini, "sweep", "seed"),
     });
 
     int parallel = sweep_gpus / train_gpus;
