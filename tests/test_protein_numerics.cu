@@ -198,9 +198,6 @@ static void section_sweep(void) {
         .space = space,
         .num_random_samples = 8,
         .suggestions_per_pareto = 16,
-        .gp_training_iter = 15,
-        .gp_learning_rate = 0.01f,
-        .optimizer_reset_frequency = 5,
         .gp_max_obs = 64,
         .infer_batch_size = 64,
         .use_success_prob = 1,
@@ -233,10 +230,6 @@ static void section_sweep(void) {
         rec_i(buf, info.n_gp_obs);
         snprintf(buf, sizeof(buf), "%s.n_cands", pref);
         rec_i(buf, info.n_candidates);
-        snprintf(buf, sizeof(buf), "%s.score_loss", pref);
-        rec_f(buf, info.score_loss);
-        snprintf(buf, sizeof(buf), "%s.cost_loss", pref);
-        rec_f(buf, info.cost_loss);
         snprintf(buf, sizeof(buf), "%s.pred_score", pref);
         rec_f(buf, info.predicted_score);
         snprintf(buf, sizeof(buf), "%s.pred_cost", pref);

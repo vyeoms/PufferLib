@@ -21,10 +21,18 @@
 #define NOISE_PRIOR_MU (-4.60517f)
 #define NOISE_PRIOR_SIGMA 0.5f
 #define SP_LB 1e-4
+#define LIN_IDX(np) ((np)-3)
 #define SF_IDX(np) ((np)-2)
 #define OFF_IDX(np) ((np)-1)
 #define GP_BLOCK 16
+#define GP_HUTCH_PROBES 8
 #define KD_LEAF 16
+#define GP_MAX_PARAMS 64
+#define GP_FISHER_DAMP 1e-3f
+#define GP_FISHER_MAX_STEP 1.0f
+#define GP_FISHER_STEPS 3
+#define GP_NOISE_FLOOR 0.01f
+#define GP_LIN_MEDIAN 0.1f
 
 typedef enum {
     SPACE_LINEAR,
@@ -103,11 +111,12 @@ static inline int gp_grid(int n) {
     return (n + GP_BLOCK - 1) / GP_BLOCK;
 }
 
-// Gram / cross-covariance: K = sigma_f * (x·x' + offset + Matern32(r))
+// Gram / cross-covariance: K = sigma_f * (x·x' + offset + Matern32(r)), or with lin_dim >= 0
+// K = lin * x_d·x'_d + sigma_f * (offset + Matern32(r)) for d = lin_dim
 __global__ void matern32lin_k_kernel(const float *__restrict__ X1,
         const float *__restrict__ X2, float *__restrict__ K,
         const float *__restrict__ inv_ells, int n, int m, int d, float sigma_f,
-        float diag_noise, float offset) {
+        float diag_noise, float offset, float lin, int lin_dim) {
     int col = blockIdx.x * GP_BLOCK + threadIdx.x;
     int row = blockIdx.y * GP_BLOCK + threadIdx.y;
     if (row >= n || col >= m) {
@@ -116,47 +125,46 @@ __global__ void matern32lin_k_kernel(const float *__restrict__ X1,
     float dot = 0.0, r2 = 0.0;
     for (int k = 0; k < d; k++) {
         float xr = X1[row * d + k], xc = X2[col * d + k];
-        dot += xr * xc;
+        dot += lin_dim < 0 || k == lin_dim ? xr * xc : 0.0f;
         float diff = (xr - xc) * inv_ells[k];
         r2 += diff * diff;
     }
     float u = sqrt(3.0) * sqrt(r2);
-    float val = sigma_f * (dot + offset + (1.0 + u) * exp(-u));
+    float lin_dot = lin_dim < 0 ? 0.0f : dot;
+    float val = lin * lin_dot + sigma_f * (dot - lin_dot + offset + (1.0 + u) * exp(-u));
     if (diag_noise != 0.0 && row == col) {
         val += diag_noise;
     }
     K[col * n + row] = val;
 }
 
-// Write constant onto diagonal (stride n+1). Used to form I for spotrs → K^{-1}.
-__global__ void gp_k_set_diag(float *A, int n, float val) {
+// Fill Z[0..total) with ±1 Rademacher probes, resampled each Fisher step via counter
+__global__ void gp_fill_rademacher(float *Z, int total,
+        unsigned long long seed, unsigned long long counter) {
     int i = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (i < n) {
-        A[i * (n + 1)] = val;
+    if (i >= total) {
+        return;
     }
+    curandStatePhilox4_32_10_t st;
+    curand_init(seed, i, counter, &st);
+    Z[i] = (curand_uniform(&st) < 0.5f) ? -1.0f : 1.0f;
 }
 
-// Copy matrix diagonal (stride n+1) to a dense vector (L_ii for host logdet).
-__global__ void gp_k_extract_diag(const float *A, float *d, int n) {
-    int i = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (i < n) {
-        d[i] = A[i * (n + 1)];
-    }
-}
-
-// Fused MLL kernel grads: per (i,j) W=ααᵀ−K⁻¹ terms for ∂/∂ℓ, ∂/∂σ_f, ∂/∂offset.
-// Block partials via block_reduce_sum into out_partials[bid * (d+2) + ·]; host folds
-// in fixed block order. Dynamic smem: (d+2) * GP_BLOCK² floats.
+// Fused MLL kernel grads: per (i,j) W = alpha alpha^T - (K^-1)_ij terms for d/dell, d/dlin,
+// d/dsigma_f, d/doffset (lin_dim < 0 folds the linear term into sigma_f). Summing
+// W_ij (dK/dtheta)_ij gives alpha^T (dK/dtheta) alpha - tr(K^-1 dK/dtheta). Kinv holds the lower
+// triangle of K^-1. Block partials via block_reduce_sum into out_partials[bid * (d+3) + .]; the
+// host folds them in fixed block order. Dynamic smem: (d+3) * GP_BLOCK^2 floats.
 __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
         const float *__restrict__ alpha, const float *__restrict__ Kinv,
-        const float *__restrict__ inv_ells, int n, int d, float sigma_f,
-        float offset, float *__restrict__ out_partials) {
+        const float *__restrict__ inv_ells, int n, int d, float sigma_f, float offset, int lin_dim,
+        float *__restrict__ out_partials) {
     extern __shared__ float sh[];
     int col = blockIdx.x * GP_BLOCK + threadIdx.x;
     int row = blockIdx.y * GP_BLOCK + threadIdx.y;
     int tid = threadIdx.y * GP_BLOCK + threadIdx.x;
     int nthreads = GP_BLOCK * GP_BLOCK;
-    int nsum = d + 2;
+    int nsum = d + 3;
 
     for (int c = 0; c < nsum; c++) {
         sh[c * nthreads + tid] = 0.0f;
@@ -165,21 +173,22 @@ __global__ void matern32lin_mll_grad_fuse(const float *__restrict__ X,
         float dot = 0.0f, r2 = 0.0f;
         for (int k = 0; k < d; k++) {
             float xr = X[row * d + k], xc = X[col * d + k];
-            dot += xr * xc;
+            dot += lin_dim < 0 || k == lin_dim ? xr * xc : 0.0f;
             float t = (xr - xc) * inv_ells[k];
             r2 += t * t;
         }
         float u = sqrtf(3.0f) * sqrtf(r2);
-        float e = expf(-u);
-        float W = alpha[row] * alpha[col] - Kinv[col * n + row];
+        float e = expf(-u), lin_dot = lin_dim < 0 ? 0.0f : dot;
+        float W = alpha[row] * alpha[col] - Kinv[min(row, col) * n + max(row, col)];
         for (int dd = 0; dd < d; dd++) {
             float diff = X[row * d + dd] - X[col * d + dd];
             float inv = inv_ells[dd];
             sh[dd * nthreads + tid] =
                 W * (sigma_f * 3.0f * diff * diff * inv * inv * inv * e);
         }
-        sh[d * nthreads + tid] = W * (dot + offset + (1.0f + u) * e);
-        sh[(d + 1) * nthreads + tid] = W;
+        sh[d * nthreads + tid] = W * lin_dot;
+        sh[(d + 1) * nthreads + tid] = W * (dot - lin_dot + offset + (1.0f + u) * e);
+        sh[(d + 2) * nthreads + tid] = W;
     }
     int bid = blockIdx.y * gridDim.x + blockIdx.x;
     block_reduce_sum(sh, out_partials + bid * nsum, tid, nthreads, nsum);
@@ -195,8 +204,12 @@ typedef struct {
     cublasHandle_t cublas;
     cusolverDnHandle_t cusolver;
     GPKernel *kernel;
-    float *d_inv_ells, *d_diag, *d_Kinv, *d_partials, *d_Ks, *d_ones;
-    float *h_kg, *h_diag, *h_partials;
+    float *d_inv_ells, *d_partials, *d_Ks, *d_ones;
+    float *d_Z, *d_U, *d_G, *d_Kinv, *d_u, *d_spg, *d_F;
+    float noise_floor, lin_mu, lin_sigma;
+    int lin_dim;
+    unsigned long long hutch_seed, hutch_t;
+    float *h_partials;
 } GaussianProcess;
 
 static void matern32lin_build_K(GaussianProcess *gp, const float *d_X1,
@@ -211,17 +224,19 @@ static void matern32lin_build_K(GaussianProcess *gp, const float *d_X1,
         cudaMemcpyHostToDevice, stream);
     float sigma_f = softplus(gp->kernel->raw_params[SF_IDX(np)]);
     float offset = softplus(gp->kernel->raw_params[OFF_IDX(np)]);
+    float lin = softplus(gp->kernel->raw_params[LIN_IDX(np)]);
     dim3 block(GP_BLOCK, GP_BLOCK), grid(gp_grid(m), gp_grid(n));
     matern32lin_k_kernel<<<grid, block, 0, stream>>>(
-        d_X1, d_X2, d_K, gp->d_inv_ells, n, m, d, sigma_f, diag_noise, offset);
+        d_X1, d_X2, d_K, gp->d_inv_ells, n, m, d, sigma_f, diag_noise, offset, lin, gp->lin_dim);
 }
 
 static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noise) {
     memset(gp, 0, sizeof(*gp));
+    gp->lin_dim = -1;
     gp->dim = dim;
     gp->cap = cap;
-    int n_params = dim + 2;
-    int nsum = dim + 2;
+    int n_params = dim + 3;
+    int nsum = dim + 3;
     int nblocks = gp_grid(cap) * gp_grid(cap);
     GPKernel *k = (GPKernel *)malloc(sizeof(GPKernel) + n_params * sizeof(float));
     k->n_params = n_params;
@@ -229,6 +244,7 @@ static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noi
     for (int i = 0; i < dim; i++) {
         k->raw_params[i] = inv_softplus(1.0f);
     }
+    k->raw_params[LIN_IDX(n_params)] = inv_softplus(1.0f);
     k->raw_params[SF_IDX(n_params)] = inv_softplus(1.0f);
     k->raw_params[OFF_IDX(n_params)] = inv_softplus(1.0f);
     gp->kernel = k;
@@ -240,21 +256,29 @@ static void gp_init(GaussianProcess *gp, int dim, int cap, int pred_m, float noi
     cudaMalloc(&gp->d_alpha, cap * sizeof(float));
     cudaMalloc(&gp->d_info, sizeof(int));
     cudaMalloc(&gp->d_inv_ells, dim * sizeof(float));
-    cudaMalloc(&gp->d_diag, cap * sizeof(float));
-    cudaMalloc(&gp->d_Kinv, cap * cap * sizeof(float));
+    cudaMalloc(&gp->d_Z, cap * GP_HUTCH_PROBES * sizeof(float));
+    cudaMalloc(&gp->d_U, cap * GP_HUTCH_PROBES * sizeof(float));
+    gp->hutch_seed = 0x9E3779B97F4A7C15ULL;
     cudaMalloc(&gp->d_partials, nblocks * nsum * sizeof(float));
     // Dominant device buffer: cap × acq_cap floats (×2 GPs)
     assert(cudaMalloc(&gp->d_Ks, cap * pred_m * sizeof(float)) == cudaSuccess);
     cudaMalloc(&gp->d_ones, sizeof(float));
     float one = 1.0f;
     cudaMemcpy(gp->d_ones, &one, sizeof(float), cudaMemcpyHostToDevice);
-    gp->h_kg = (float *)malloc(n_params * sizeof(float));
-    gp->h_diag = (float *)malloc(cap * sizeof(float));
     gp->h_partials = (float *)malloc(nblocks * nsum * sizeof(float));
+    int nc = dim + 4;
+    cudaMalloc(&gp->d_spg, (nc + nc * nc + cap) * sizeof(float));
+    gp->d_F = gp->d_spg + nc;
+    gp->d_u = gp->d_F + nc * nc;
+    cudaMalloc(&gp->d_G, (size_t)nc * GP_HUTCH_PROBES * cap * sizeof(float));
+    cudaMalloc(&gp->d_Kinv, cap * cap * sizeof(float));
     cublasCreate(&gp->cublas);
     cusolverDnCreate(&gp->cusolver);
+    int lwork;
     cusolverDnSpotrf_bufferSize(
         gp->cusolver, CUBLAS_FILL_MODE_LOWER, cap, gp->d_L, cap, &gp->lwork);
+    cusolverDnSpotri_bufferSize(gp->cusolver, CUBLAS_FILL_MODE_LOWER, cap, gp->d_L, cap, &lwork);
+    gp->lwork = max(gp->lwork, lwork);
     cudaMalloc(&gp->d_work, gp->lwork * sizeof(float));
 }
 
@@ -270,7 +294,7 @@ static int run_potrf(GaussianProcess *gp, float *d_K, int n, cudaStream_t stream
 
 static int gp_recompute(GaussianProcess *gp, cudaStream_t stream) {
     int n = gp->n;
-    float noise = softplus(gp->raw_noise);
+    float noise = softplus(gp->raw_noise) + gp->noise_floor;
     matern32lin_build_K(gp, gp->d_X, gp->d_X, n, n, noise, gp->d_L, stream);
     int info = run_potrf(gp, gp->d_L, n, stream);
     if (info != 0) {
@@ -303,131 +327,180 @@ static void gp_predict(GaussianProcess *gp, const float *d_Xte, float *d_means, 
     cublasSaxpy(gp->cublas, m, &gp->mean, gp->d_ones, 0, d_means, 1);
 }
 
-// Train kernel hyperparameters with Adam (score GP and cost GP).
-static float gp_train(GaussianProcess *gp, float *opt_m, float *opt_v,
-        float *opt_vmax, int *opt_t, float lr, const float *X, const float *y,
-        int n_data, int training_iter, cudaStream_t stream) {
-    cudaMemcpyAsync(gp->d_X, X, n_data * gp->dim * sizeof(float),
-        cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(gp->d_y, y, n_data * sizeof(float),
-        cudaMemcpyHostToDevice, stream);
-    gp->n = n_data;
-    if (gp_recompute(gp, stream) != 0) {
-        return 0.0f;
+// G[:, i*P + p] = dK_i V[:, p] for p < P, i < d + 4, with dK_i = dK/draw_i for raw
+// [ell_0..ell_{d-1}, lin, sigma_f, offset, noise] computed on the fly
+__global__ void matern32lin_dK_matvec(const float *X, const float *V, const float *inv_ells,
+        const float *spg, float *G, int n, int d, int P, float sigma_f, float offset,
+        int lin_dim) {
+    int a = blockIdx.x * BLOCK_SIZE + threadIdx.x, p = blockIdx.y;
+    if (a >= n) {
+        return;
     }
+    const float *v = V + p * n;
+    float acc[GP_MAX_PARAMS];
+    for (int k = 0; k < d + 3; k++) {
+        acc[k] = 0.0f;
+    }
+    for (int j = 0; j < n; j++) {
+        float dot = 0.0f, r2 = 0.0f;
+        for (int k = 0; k < d; k++) {
+            float xa = X[a * d + k], xj = X[j * d + k];
+            dot += lin_dim < 0 || k == lin_dim ? xa * xj : 0.0f;
+            float t = (xa - xj) * inv_ells[k];
+            r2 += t * t;
+        }
+        float u = sqrtf(3.0f * r2), e = expf(-u), vj = v[j], lin_dot = lin_dim < 0 ? 0.0f : dot;
+        for (int k = 0; k < d; k++) {
+            float diff = X[a * d + k] - X[j * d + k], inv = inv_ells[k];
+            acc[k] += vj * 3.0f * diff * diff * inv * inv * inv * e;
+        }
+        acc[d] += vj * lin_dot;
+        acc[d + 1] += vj * (dot - lin_dot + offset + (1.0f + u) * e);
+        acc[d + 2] += vj;
+    }
+    int nc = d + 4;
+    for (int k = 0; k < nc; k++) {
+        float w = k == d || k == d + 1 ? acc[k] : k < nc - 1 ? sigma_f * acc[k] : v[a];
+        G[(size_t)(k * P + p) * n + a] = w * spg[k];
+    }
+}
 
-    int n_kp = gp->kernel->n_params;
-    int n_opt = n_kp + 2;
-    int d = gp->dim;
-    int nsum = d + 2;
-    float loss = 0.0f;
-    const float beta1 = 0.9f, beta2 = 0.999f;
+// Fit kernel hyperparameters by damped Fisher scoring on the log posterior over raw
+// [ells, lin, sigma_f, offset, noise, mean]. Fisher_ij = 1/2 tr(S_i S_j) with S_i = L^-1 dK_i L^-T,
+// estimated from P Rademacher probes as 1/2 E[(S_i z)^T S_j z] (a Gram matrix, so PSD); the mean
+// block is 1^T K^-1 1 (mean and covariance params are Fisher-orthogonal). The gradient is exact
+// from K^-1. Priors add Gauss-Newton terms: a dimension-scaled log-normal on each lengthscale
+// (Hvarfner et al., ICML 2024: mean shifted by +1/2 log D), log-normals on the noise and, with
+// lin_dim >= 0, on the separate linear weight.
+static void gp_train(GaussianProcess *gp, const float *X, const float *y, int n,
+        cudaStream_t stream) {
+    cudaMemcpyAsync(gp->d_X, X, n * gp->dim * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(gp->d_y, y, n * sizeof(float), cudaMemcpyHostToDevice, stream);
+    gp->n = n;
+    if (gp_recompute(gp, stream) != 0) {
+        return;
+    }
+    int d = gp->dim, n_kp = gp->kernel->n_params, n_opt = n_kp + 2, nc = n_kp + 1, nsum = d + 3;
+    int P = GP_HUTCH_PROBES, nn = n * n;
+    float ls_mu = 1.4142135f + 0.5f * logf(d), ls_sigma = 1.7320508f;
+    float *raw = gp->kernel->raw_params;
+    const float one = 1.0f, zero = 0.0f, half_p = 0.5f / P;
+    dim3 b(GP_BLOCK, GP_BLOCK), g(gp_grid(n), gp_grid(n));
+    int nblocks = g.x * g.y;
+    for (int s = 0; s < GP_FISHER_STEPS; s++) {
+        float sigma_f = softplus(raw[SF_IDX(n_kp)]), offset = softplus(raw[OFF_IDX(n_kp)]);
+        float inv_ells[d], spg[nc];
+        for (int i = 0; i < d; i++) {
+            inv_ells[i] = 1.0f / softplus(raw[i]);
+        }
+        for (int i = 0; i < nc - 1; i++) {
+            spg[i] = softplus_grad(raw[i]);
+        }
+        spg[nc - 1] = softplus_grad(gp->raw_noise);
+        cudaMemcpyAsync(gp->d_inv_ells, inv_ells, d * sizeof(float), cudaMemcpyHostToDevice,
+            stream);
+        cudaMemcpyAsync(gp->d_spg, spg, nc * sizeof(float), cudaMemcpyHostToDevice, stream);
+        cublasSetStream(gp->cublas, stream);
+        cusolverDnSetStream(gp->cusolver, stream);
+        // u = L^-1 1 for the mean block
+        cudaMemsetAsync(gp->d_u, 0, n * sizeof(float), stream);
+        cublasSaxpy(gp->cublas, n, &one, gp->d_ones, 0, gp->d_u, 1);
+        cublasStrsv(gp->cublas, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, n,
+            gp->d_L, n, gp->d_u, 1);
+        // Fisher: V = L^-T Z, G[:, i*P + p] = S_i z_p
+        gp_fill_rademacher<<<(n * P + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            gp->d_Z, n * P, gp->hutch_seed, gp->hutch_t++);
+        cudaMemcpyAsync(gp->d_U, gp->d_Z, n * P * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        cublasStrsm(gp->cublas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
+            CUBLAS_DIAG_NON_UNIT, n, P, &one, gp->d_L, n, gp->d_U, n);
+        dim3 mg((n + BLOCK_SIZE - 1) / BLOCK_SIZE, P);
+        matern32lin_dK_matvec<<<mg, BLOCK_SIZE, 0, stream>>>(gp->d_X, gp->d_U, gp->d_inv_ells,
+            gp->d_spg, gp->d_G, n, d, P, sigma_f, offset, gp->lin_dim);
+        cublasStrsm(gp->cublas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+            CUBLAS_DIAG_NON_UNIT, n, nc * P, &one, gp->d_L, n, gp->d_G, n);
+        cublasSgemm(gp->cublas, CUBLAS_OP_T, CUBLAS_OP_N, nc, nc, n * P, &half_p, gp->d_G, n * P,
+            gp->d_G, n * P, &zero, gp->d_F, nc);
+        // Gradient: alpha^T dK_i alpha - tr(K^-1 dK_i) with K^-1 from potri
+        cudaMemcpyAsync(gp->d_Kinv, gp->d_L, nn * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        cusolverDnSpotri(gp->cusolver, CUBLAS_FILL_MODE_LOWER, n, gp->d_Kinv, n, gp->d_work,
+            gp->lwork, gp->d_info);
+        matern32lin_mll_grad_fuse<<<g, b, nsum * GP_BLOCK * GP_BLOCK * sizeof(float), stream>>>(
+            gp->d_X, gp->d_alpha, gp->d_Kinv, gp->d_inv_ells, n, d, sigma_f, offset, gp->lin_dim,
+            gp->d_partials);
+        cudaMemcpyAsync(gp->h_partials, gp->d_partials, nblocks * nsum * sizeof(float),
+            cudaMemcpyDeviceToHost, stream);
+        float F[nc * nc], gr[nc], aa, tk, sum_u, sum_alpha;
+        cublasSdot(gp->cublas, n, gp->d_alpha, 1, gp->d_alpha, 1, &aa);
+        cublasSdot(gp->cublas, n, gp->d_Kinv, n + 1, gp->d_ones, 0, &tk);
+        cublasSdot(gp->cublas, n, gp->d_u, 1, gp->d_u, 1, &sum_u);
+        cublasSdot(gp->cublas, n, gp->d_alpha, 1, gp->d_ones, 0, &sum_alpha);
+        cudaMemcpyAsync(F, gp->d_F, nc * nc * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        for (int c = 0; c < nsum; c++) {
+            gr[c] = 0.0f;
+            for (int bi = 0; bi < nblocks; bi++) {
+                gr[c] += gp->h_partials[bi * nsum + c];
+            }
+            gr[c] *= 0.5f * spg[c] * (c == nsum - 1 ? sigma_f : 1.0f);
+        }
+        gr[nc - 1] = 0.5f * (aa - tk) * spg[nc - 1];
 
-    for (int iter = 0; iter < training_iter; iter++) {
+        float H[n_opt * n_opt], step[n_opt];
+        memset(H, 0, sizeof(H));
+        for (int i = 0; i < nc; i++) {
+            for (int j = 0; j < nc; j++) {
+                H[i * n_opt + j] = F[i * nc + j];
+            }
+            step[i] = gr[i];
+        }
+        H[n_opt * n_opt - 1] = sum_u;
+        step[n_opt - 1] = sum_alpha;
+        for (int k = 0; k < nc; k++) {
+            int lin = k == LIN_IDX(n_kp) && gp->lin_dim >= 0;
+            if (k >= d && k < nc - 1 && !lin) {
+                continue;
+            }
+            float v = k < nc - 1 ? softplus(raw[k]) : softplus(gp->raw_noise) + gp->noise_floor;
+            float mu = k < d ? ls_mu : lin ? gp->lin_mu : NOISE_PRIOR_MU;
+            float sg = k < d ? ls_sigma : lin ? gp->lin_sigma : NOISE_PRIOR_SIGMA;
+            float jac = spg[k] / v, z = (logf(v) - mu) / sg;
+            step[k] += (-z / sg - 1.0f) * jac;
+            H[k * n_opt + k] += jac * jac / (sg * sg);
+        }
+
+        // step = (H damped)^-1 grad via in-place row-major Cholesky
+        for (int i = 0; i < n_opt; i++) {
+            H[i * n_opt + i] = H[i * n_opt + i] * (1.0f + GP_FISHER_DAMP) + 1e-6f;
+        }
+        for (int j = 0; j < n_opt; j++) {
+            for (int i = j; i < n_opt; i++) {
+                float acc = H[i * n_opt + j];
+                for (int k = 0; k < j; k++) {
+                    acc -= H[i * n_opt + k] * H[j * n_opt + k];
+                }
+                H[i * n_opt + j] = i == j ? sqrtf(acc) : acc / H[j * n_opt + j];
+            }
+        }
+        for (int i = 0; i < n_opt; i++) {
+            for (int k = 0; k < i; k++) {
+                step[i] -= H[i * n_opt + k] * step[k];
+            }
+            step[i] /= H[i * n_opt + i];
+        }
+        for (int i = n_opt - 1; i >= 0; i--) {
+            for (int k = i + 1; k < n_opt; k++) {
+                step[i] -= H[k * n_opt + i] * step[k];
+            }
+            step[i] /= H[i * n_opt + i];
+        }
+        for (int i = 0; i < n_opt; i++) {
+            float *p = i < n_kp ? &raw[i] : i == n_kp ? &gp->raw_noise : &gp->mean;
+            *p += fmaxf(-GP_FISHER_MAX_STEP, fminf(GP_FISHER_MAX_STEP, step[i]));
+        }
         if (gp_recompute(gp, stream) != 0) {
             break;
         }
-        int n = gp->n;
-        const GPKernel *k = gp->kernel;
-        int np = k->n_params;
-        cublasSetStream(gp->cublas, stream);
-        float data_fit, sum_alpha;
-        cublasSdot(gp->cublas, n, gp->d_y, 1, gp->d_alpha, 1, &data_fit);
-        cublasSdot(gp->cublas, n, gp->d_alpha, 1, gp->d_ones, 0, &sum_alpha);
-        data_fit -= gp->mean * sum_alpha;
-        gp_k_extract_diag<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE,
-            BLOCK_SIZE, 0, stream>>>(gp->d_L, gp->d_diag, n);
-        cudaMemcpyAsync(gp->h_diag, gp->d_diag, n * sizeof(float),
-            cudaMemcpyDeviceToHost, stream);
-        cudaMemsetAsync(gp->d_Kinv, 0, n * n * sizeof(float), stream);
-        gp_k_set_diag<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-            gp->d_Kinv, n, 1.0f);
-        cusolverDnSetStream(gp->cusolver, stream);
-        cusolverDnSpotrs(gp->cusolver, CUBLAS_FILL_MODE_LOWER, n, n, gp->d_L, n,
-            gp->d_Kinv, n, gp->d_info);
-        float term1, term2;
-        cublasSdot(gp->cublas, n, gp->d_alpha, 1, gp->d_alpha, 1, &term1);
-        cublasSasum(gp->cublas, n, gp->d_Kinv, n + 1, &term2);
-        float d_noise = 0.5f * (term1 - term2) * softplus_grad(gp->raw_noise) / n;
-
-        float sigma_f = softplus(k->raw_params[SF_IDX(np)]);
-        float offset = softplus(k->raw_params[OFF_IDX(np)]);
-        float h_inv[d];
-        for (int i = 0; i < d; i++) {
-            h_inv[i] = 1.0f / softplus(k->raw_params[i]);
-        }
-        cudaMemcpyAsync(gp->d_inv_ells, h_inv, d * sizeof(float),
-            cudaMemcpyHostToDevice, stream);
-        dim3 b(GP_BLOCK, GP_BLOCK), g(gp_grid(n), gp_grid(n));
-        int nblocks = g.x * g.y;
-        int nthreads = GP_BLOCK * GP_BLOCK;
-        matern32lin_mll_grad_fuse<<<g, b, nsum * nthreads * sizeof(float), stream>>>(
-            gp->d_X, gp->d_alpha, gp->d_Kinv, gp->d_inv_ells, n, d, sigma_f,
-            offset, gp->d_partials);
-        cudaMemcpyAsync(gp->h_partials, gp->d_partials,
-            nblocks * nsum * sizeof(float), cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-
-        float log_det = 0.0f;
-        for (int i = 0; i < n; i++) {
-            log_det += logf(gp->h_diag[i]);
-        }
-        float h_sums[nsum];
-        for (int c = 0; c < nsum; c++) {
-            h_sums[c] = 0.0f;
-        }
-        for (int bi = 0; bi < nblocks; bi++) {
-            for (int c = 0; c < nsum; c++) {
-                h_sums[c] += gp->h_partials[bi * nsum + c];
-            }
-        }
-        float inv_n = 0.5f / n;
-        for (int dd = 0; dd < d; dd++) {
-            gp->h_kg[dd] = inv_n * h_sums[dd] * softplus_grad(k->raw_params[dd]);
-        }
-        gp->h_kg[SF_IDX(np)] =
-            inv_n * h_sums[d] * softplus_grad(k->raw_params[SF_IDX(np)]);
-        gp->h_kg[OFF_IDX(np)] =
-            inv_n * sigma_f * h_sums[d + 1] * softplus_grad(k->raw_params[OFF_IDX(np)]);
-
-        float mll = (-0.5f * data_fit - log_det - 0.5f * n * logf(2.0f * M_PI)) / n;
-        float noise_val = softplus(gp->raw_noise);
-        float ln_noise = logf(noise_val);
-        float sig = softplus_grad(gp->raw_noise);
-        float z = (ln_noise - NOISE_PRIOR_MU) / NOISE_PRIOR_SIGMA;
-        float np_grad = ((-z / NOISE_PRIOR_SIGMA - 1.0f) * sig / noise_val) / n;
-        loss = -mll - (-0.5f * z * z - ln_noise - logf(NOISE_PRIOR_SIGMA)) / n;
-
-        (*opt_t)++;
-        float bc1 = 1.0f - powf(beta1, (*opt_t));
-        float bc2 = 1.0f - powf(beta2, (*opt_t));
-        float d_mean = sum_alpha / n;
-        for (int i = 0; i < n_opt; i++) {
-            float g;
-            if (i < n_kp) {
-                g = -gp->h_kg[i];
-            } else if (i == n_kp) {
-                g = -d_noise - np_grad;
-            } else {
-                g = -d_mean;
-            }
-            opt_m[i] = beta1 * opt_m[i] + (1.0f - beta1) * g;
-            opt_v[i] = beta2 * opt_v[i] + (1.0f - beta2) * g * g;
-            float m_hat = opt_m[i] / bc1;
-            float v_hat = opt_v[i] / bc2;
-            opt_vmax[i] = fmaxf(opt_vmax[i], v_hat);
-            float step = lr * m_hat / (sqrtf(opt_vmax[i]) + 1e-8f);
-            if (i < n_kp) {
-                gp->kernel->raw_params[i] -= step;
-            } else if (i == n_kp) {
-                gp->raw_noise -= step;
-            } else {
-                gp->mean -= step;
-            }
-        }
     }
-    gp_recompute(gp, stream);
-    return loss;
 }
 
 // Candidate sampling (score / argmax run on host after GP predict)
@@ -464,7 +537,7 @@ __global__ void protein_k_sample(float *__restrict__ candidates,
 }
 
 typedef struct {
-    float score_loss, cost_loss, predicted_score, predicted_cost, rating;
+    float predicted_score, predicted_cost, rating;
     int n_pareto, n_gp_obs, n_candidates, is_random;
 } ProteinSweepInfo;
 
@@ -478,9 +551,6 @@ typedef struct {
     SweepSpace *space;
     int num_random_samples;
     int suggestions_per_pareto;
-    int gp_training_iter;
-    float gp_learning_rate;
-    int optimizer_reset_frequency;
     int gp_max_obs;
     int infer_batch_size;
     int use_success_prob;
@@ -495,6 +565,9 @@ typedef struct {
     int failure_cap;
     int top_k;
     unsigned long long rng_seed;
+    // > 0: separate score-GP linear weight over the cost dim only, log-normal prior with this
+    // log-sd. 0: linear over all dims, tied to sigma_f
+    float gp_lin_sigma;
     // Internal
     float *succ_params, *succ_scores, *succ_costs;
     float *fail_params, *fail_scores, *fail_costs;
@@ -508,8 +581,6 @@ typedef struct {
     float *clf_w, clf_bias;
     int clf_fitted;
     GaussianProcess gp_score, gp_cost;
-    float *opt_m; // 6 * n_opt: score m,v,vmax, cost m,v,vmax
-    int opt_t_score, opt_t_cost, n_opt;
     curandGenerator_t sobol;
     cudaStream_t stream;
     int suggestion_idx;
@@ -531,7 +602,6 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     int dim = sw->space->num;
     sw->dim = dim;
     sw->cost_dim = sw->space->cost_idx;
-    sw->opt_t_score = sw->opt_t_cost = 0;
     sw->succ_n = sw->fail_n = sw->check_n = sw->suggestion_idx = 0;
     sw->clf_fitted = sw->pool_remaining = 0;
     sw->min_score = FLT_MAX;
@@ -580,8 +650,10 @@ ProteinSweep *protein_sweep_create(ProteinSweep init) {
     sw->clf_w = (float *)calloc(dim, sizeof(float));
     gp_init(&sw->gp_score, dim, sw->gp_max_obs, acq_cap, 0.01f);
     gp_init(&sw->gp_cost, dim, sw->gp_max_obs, acq_cap, 0.01f);
-    sw->n_opt = sw->gp_score.kernel->n_params + 2;
-    sw->opt_m = (float *)calloc(6 * sw->n_opt, sizeof(float));
+    sw->gp_score.noise_floor = GP_NOISE_FLOOR;
+    sw->gp_score.lin_mu = logf(GP_LIN_MEDIAN);
+    sw->gp_score.lin_sigma = sw->gp_lin_sigma;
+    sw->gp_score.lin_dim = sw->gp_lin_sigma > 0 ? sw->cost_dim : -1;
 
     curandCreateGeneratorHost(&sw->sobol, CURAND_RNG_QUASI_SCRAMBLED_SOBOL32);
     curandSetQuasiRandomGeneratorDimensions(sw->sobol, dim);
@@ -926,19 +998,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     }
 
     // Train GPs
-    float *sm = sw->opt_m, *sv = sm + sw->n_opt, *svx = sv + sw->n_opt;
-    float *cm = svx + sw->n_opt, *cv = cm + sw->n_opt, *cvx = cv + sw->n_opt;
-    float score_loss = gp_train(
-        &sw->gp_score, sm, sv, svx, &sw->opt_t_score, sw->gp_learning_rate,
-        sw->gp_train_params, sw->gp_train_y, n_gp, sw->gp_training_iter, sw->stream);
-    float cost_loss = gp_train(
-        &sw->gp_cost, cm, cv, cvx, &sw->opt_t_cost, sw->gp_learning_rate,
-        sw->gp_train_params, sw->gp_train_c, n_gp, sw->gp_training_iter, sw->stream);
-    if (sw->optimizer_reset_frequency > 0
-            && sw->suggestion_idx % sw->optimizer_reset_frequency == 0) {
-        memset(sw->opt_m, 0, 6 * sw->n_opt * sizeof(float));
-        sw->opt_t_score = sw->opt_t_cost = 0;
-    }
+    gp_train(&sw->gp_score, sw->gp_train_params, sw->gp_train_y, n_gp, sw->stream);
+    gp_train(&sw->gp_cost, sw->gp_train_params, sw->gp_train_c, n_gp, sw->stream);
 
     // Pareto front + prune
     for (int i = 0; i < sw->succ_n; i++) {
@@ -1160,8 +1221,6 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
     memcpy(out, &sw->h_cands[best * dim], dim * sizeof(float));
     float y_norm = sw->h_pred[best], c_norm = sw->h_pred[n_cands + best];
 
-    info.score_loss = score_loss;
-    info.cost_loss = cost_loss;
     info.predicted_score = sw->space->optimize_direction
         * (y_norm * (max_score - min_score) + min_score);
     info.predicted_cost = expf(c_norm * (log_c_max - log_c_min) + log_c_min);

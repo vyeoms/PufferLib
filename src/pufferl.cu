@@ -2664,9 +2664,6 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .space = space,
         .num_random_samples = 10,
         .suggestions_per_pareto = 256,
-        .gp_training_iter = 50,
-        .gp_learning_rate = 0.001f,
-        .optimizer_reset_frequency = 50,
         .gp_max_obs = 750,
         .infer_batch_size = 4096,
         .use_success_prob = downsample == 1,
@@ -2681,6 +2678,7 @@ void run_sweep(Ini* ini, const char* exe_path) {
         .failure_cap = 1024,
         .top_k = 5,
         .rng_seed = puf_ini_get(ini, "sweep", "seed"),
+        .gp_lin_sigma = puf_ini_get(ini, "sweep", "gp_lin_sigma"),
     });
 
     int parallel = sweep_gpus / train_gpus;
