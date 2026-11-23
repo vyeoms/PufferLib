@@ -615,6 +615,7 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
     if (sw->use_logit) {
         score = logit_transform(score);
     }
+    score *= sw->space->optimize_direction;  // stored so that higher is better
     int dim = sw->dim;
     if (is_failure || !isfinite(score)) {
         if (sw->fail_n >= sw->failure_cap) {
@@ -638,9 +639,6 @@ void protein_sweep_observe(ProteinSweep *sw, const float *norm_params,
             sw->succ_costs[i] = cost;
             return;
         }
-    }
-    if (sw->cost_dim >= 0 && norm_params[sw->cost_dim] <= -1.0f) {
-        return;
     }
     if (sw->succ_n >= sw->success_cap) {
         return;
@@ -974,11 +972,11 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
         float c_range2 = fmaxf(c_max - c_min, PROTEIN_EPSILON);
         float max_pareto_s = sw->succ_scores[sw->pruned_buf[n_pruned - 1]];
         for (int i = n_pruned - 1; i > 1; i--) {
-            if (sw->succ_scores[sw->pruned_buf[i - 1]] < 0.98f * max_pareto_s) {
+            float prev = sw->succ_scores[sw->pruned_buf[i - 1]];
+            if (max_pareto_s - prev > 0.02f * fabsf(max_pareto_s)) {
                 break;
             }
-            float ng = (sw->succ_scores[sw->pruned_buf[i]]
-                - sw->succ_scores[sw->pruned_buf[i - 1]]) / s_range;
+            float ng = (sw->succ_scores[sw->pruned_buf[i]] - prev) / s_range;
             float nc = (sw->succ_costs[sw->pruned_buf[i]]
                 - sw->succ_costs[sw->pruned_buf[i - 1]]) / c_range2;
             if (ng / (nc + PROTEIN_EPSILON) >= 0.5f) {
@@ -1139,9 +1137,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
 
     int best = 0;
     float best_s = -FLT_MAX;
-    int opt_dir = sw->space->optimize_direction;
     for (int i = 0; i < n_cands; i++) {
-        float s = opt_dir * sw->h_pred[i];
+        float s = sw->h_pred[i];
         if (!is_fixed_cost) {
             float cn = sw->h_pred[n_cands + i];
             float c = expf(cn * (log_c_max - log_c_min) + log_c_min);
@@ -1165,7 +1162,8 @@ ProteinSweepInfo protein_sweep_suggest(ProteinSweep *sw,
 
     info.score_loss = score_loss;
     info.cost_loss = cost_loss;
-    info.predicted_score = y_norm * (max_score - min_score) + min_score;
+    info.predicted_score = sw->space->optimize_direction
+        * (y_norm * (max_score - min_score) + min_score);
     info.predicted_cost = expf(c_norm * (log_c_max - log_c_min) + log_c_min);
     info.rating = best_s;
     info.n_pareto = n_use;
